@@ -1,0 +1,19 @@
+{
+  "name": "camera-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local camera-only review system prototype",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "check": "node --check server.js && node --check evidence.js && node --check public/app.js",
+    "test:tracking": ".venv\\Scripts\\python -m unittest test_tracking -v",
+    "test:review": "node test-review.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.63.0"
+  }
+}

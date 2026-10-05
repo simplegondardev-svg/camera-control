@@ -1,0 +1,13 @@
+camera-config.json
+roles-config.json
+attendance-config.json
+generic-config.json
+face-db.json
+node_modules/
+.venv/
+models/
+__pycache__/
+.yolo/
+clips/
+.sites-runtime/
+Ultralytics/
