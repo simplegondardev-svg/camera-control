@@ -8,7 +8,9 @@
     "start": "node server.js",
     "check": "node --check server.js && node --check evidence.js && node --check public/app.js",
     "test:tracking": ".venv\\Scripts\\python -m unittest test_tracking -v",
-    "test:review": "node test-review.js"
+    "test:review": "node test-review.js",
+    "test:attendance": "node test-attendance.js",
+    "test:liveness": ".venv\\Scripts\\python -m unittest test_liveness -v"
   },
   "engines": {
     "node": ">=20"

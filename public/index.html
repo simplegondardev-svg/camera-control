@@ -108,14 +108,28 @@
 
           <section class="attendance-setup" aria-labelledby="attendanceHeading">
             <h2 id="attendanceHeading">Attendance (face recognition)</h2>
-            <p class="field-note">Opt-in and biometric. Enrol only people who consent. Stores face data locally in <code>face-db.json</code>. No liveness check — a photo could fool it.</p>
+            <p class="field-note">Opt-in and biometric. Enrol only people who consent. Stores face data locally in <code>face-db.json</code>. Passive liveness screening is an additional check, not a guarantee against photo, screen, or other presentation attacks.</p>
             <label class="toggle-row"><input type="checkbox" id="attendanceToggle" /> <span>Enable face recognition</span></label>
+            <p id="attendanceEnabledStatus" class="field-note" role="status">Attendance recording disabled.</p>
+            <label class="toggle-row"><input type="checkbox" id="livenessToggle" /> <span>Enable liveness screening</span></label>
+            <p id="livenessMode" class="field-note" role="status">Liveness screening OFF — recognition does not verify that a face is live.</p>
+            <div class="schedule-fields">
+              <label for="attendanceStartTime">Attendance start time</label>
+              <input type="time" id="attendanceStartTime" step="60" value="06:00" />
+              <label for="attendanceEndTime">Attendance end time</label>
+              <input type="time" id="attendanceEndTime" step="60" value="22:00" />
+            </div>
+            <p id="attendanceScheduleStatus" class="field-note" role="status">Attendance schedule: 06:00–22:00.</p>
+            <p id="attendanceWindowStatus" class="field-note" role="status">Checking attendance window…</p>
             <form id="enrollForm" class="role-form">
               <input id="enrollName" type="text" maxlength="40" placeholder="Name to enrol (face the camera)" autocomplete="off" required />
               <button class="secondary" id="enrollButton" type="submit">Enrol face</button>
             </form>
             <p id="attendanceStatus" class="field-note" role="status">Start detection, then enable or enrol.</p>
             <p id="enrolledList" class="field-note"></p>
+            <h3>Daily attendance history</h3>
+            <ul id="attendanceRecords" class="role-list"></ul>
+            <p id="attendanceRecordsStatus" class="field-note" role="status">Loading attendance history…</p>
           </section>
 
           <dl class="details">

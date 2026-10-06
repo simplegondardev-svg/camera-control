@@ -3,6 +3,7 @@ roles-config.json
 attendance-config.json
 generic-config.json
 face-db.json
+attendance-records.json
 node_modules/
 .venv/
 models/

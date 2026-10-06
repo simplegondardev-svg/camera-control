@@ -39,6 +39,7 @@ class Watcher:
         self.tagger = RoleTagger()
         self.facebook = None
         self.attendance_on = False
+        self.liveness_enabled = False
         self.pending_enroll = None
         self.generic = GenericObjectDetector()
         self.generic_on = False
@@ -91,31 +92,18 @@ class Watcher:
         for tid in pickups:
             self.tracker.items[tid]['pickup'] = base64.b64encode(raw).decode()
         presence = self.presence.update(now, persons, w, h)
+        face_source = frame.copy() if self.attendance_on or self.pending_enroll is not None else frame
         roles = self.tagger.classify(frame, persons)
         scale = max(.55, max(h, w)/1400)
         for label, box, tid in boxes:
-            state = self.tracker.items.get(tid) if label != 'person' else None
-            color = (80, 220, 140) if label == 'person' else (240, 180, 70)
-            caption = f'person #{tid}' if label == 'person' else label
-            if label == 'person' and roles.get(tid):
+            if label != 'person':
+                continue
+            color = (80, 220, 140)
+            caption = f'person #{tid}'
+            if roles.get(tid):
                 caption = f"{roles[tid]['name']} #{tid}"
                 color = roles[tid]['color']
-            if state and state['state'] in ('in_hand', 'near_hand', 'visible_away', 'set_down'):
-                caption += ' | ' + state['state'].replace('_', ' ')
-                if state['armed']:
-                    color = (40, 220, 255)
             x1, y1, x2, y2 = box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, caption, (max(0, x1), max(25, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
-        for gid in generic_ids:
-            state = self.tracker.items.get(gid)
-            x1, y1, x2, y2 = objects[gid]['box']
-            color = (0, 170, 255)
-            caption = 'object'
-            if state and state['state'] in ('in_hand', 'near_hand', 'visible_away', 'set_down'):
-                caption += ' | ' + state['state'].replace('_', ' ')
-                if state['armed']:
-                    color = (40, 220, 255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, caption, (max(0, x1), max(25, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
         for x, y, _ in wrists:
@@ -129,24 +117,82 @@ class Watcher:
                 cv2.putText(frame, f'together x{len(pts)}', (pts[0][0], max(15, pts[0][1]-12)),
                             cv2.FONT_HERSHEY_SIMPLEX, scale, (230, 120, 255), 2)
         enrolled, faces_out = None, []
-        if self.pending_enroll is not None:
-            name, self.pending_enroll = self.pending_enroll, None
+        liveness_results = []
+        if self.attendance_on or self.pending_enroll is not None:
             try:
-                enrolled = self.faces().enroll(name, frame)
+                face_book = self.faces()
+                if self.liveness_enabled:
+                    liveness_results = face_book.check_liveness(face_source, now)
+                if self.attendance_on:
+                    faces_out = face_book.recognize(
+                        face_source,
+                        liveness_results if self.liveness_enabled else None,
+                        liveness_enabled=self.liveness_enabled,
+                    )
+                if self.pending_enroll is not None:
+                    try:
+                        name, started = self.pending_enroll
+                        if not self.liveness_enabled:
+                            detected_faces = (
+                                [item['face_data'] for item in faces_out]
+                                if self.attendance_on else None
+                            )
+                            enrolled = face_book.enroll(
+                                name,
+                                face_source,
+                                liveness_enabled=False,
+                                detected_faces=detected_faces,
+                            )
+                            self.pending_enroll = None
+                        else:
+                            if not self.attendance_on:
+                                faces_out = [
+                                    {'box': item['box'], 'name': None, 'score': 0.0,
+                                     'liveness': item['liveness'], 'face_data': item['face_data']}
+                                    for item in liveness_results
+                                ]
+                            if not liveness_results:
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'No face detected. Enrollment requires exactly one visible face.'}
+                                self.pending_enroll = None
+                            elif len(liveness_results) > 1:
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'Multiple faces detected. Enrollment requires exactly one visible face.'}
+                                self.pending_enroll = None
+                            elif liveness_results[0]['liveness'] == 'LIVE':
+                                enrolled = face_book.enroll(
+                                    name, face_source, liveness=liveness_results[0]['liveness'])
+                                self.pending_enroll = None
+                            elif now - started >= 15:
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'Enrollment timed out; no stable live face was confirmed.'}
+                                self.pending_enroll = None
+                            elif any(item['liveness'] == 'SPOOF / REJECTED' for item in liveness_results):
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'Liveness rejected; enrollment was not saved.'}
+                            elif any(item['liveness'] == 'INCONCLUSIVE' for item in liveness_results):
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'Liveness inconclusive; enrollment is waiting for a stable live face.'}
+                            else:
+                                enrolled = {'ok': False, 'name': name,
+                                            'message': 'Checking liveness; hold still facing the camera.'}
+                    except Exception as error:
+                        print(f'Face verification failed closed: {error}', file=sys.stderr)
+                        enrolled = {'ok': False, 'name': self.pending_enroll[0],
+                                    'message': f'Liveness check unavailable; enrollment blocked. {str(error)[:100]}'}
             except Exception as error:
-                enrolled = {'ok': False, 'name': name, 'message': str(error)[:140]}
-        if self.attendance_on:
-            try:
-                faces_out = self.faces().recognize(frame)
-            except Exception:
+                print(f'Face verification failed closed: {error}', file=sys.stderr)
+                enrolled = {'ok': False, 'name': self.pending_enroll[0] if self.pending_enroll else '',
+                            'message': f'Liveness check unavailable; attendance blocked. {str(error)[:100]}'}
                 faces_out = []
-            for face in faces_out:
-                x, y, fw, fh = face['box']
-                known = face['name'] is not None
-                fcolor = (90, 230, 90) if known else (160, 160, 160)
-                cv2.rectangle(frame, (x, y), (x+fw, y+fh), fcolor, 2)
-                cv2.putText(frame, face['name'] or 'Unknown', (x, max(15, y-8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, scale, fcolor, 2)
+        for face in faces_out:
+            x, y, fw, fh = face['box']
+            known_live = face['liveness'] == 'LIVE' and face['name'] is not None
+            fcolor = (90, 230, 90) if known_live else (160, 160, 160)
+            caption = face['name'] or face['liveness'].replace(' / ', '/').title()
+            cv2.rectangle(frame, (x, y), (x+fw, y+fh), fcolor, 2)
+            cv2.putText(frame, caption, (x, max(15, y-8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, fcolor, 2)
         ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ok:
             raise ValueError('Cannot encode preview')
@@ -159,8 +205,10 @@ class Watcher:
                 'roleCounts': {r['name']: sum(v['name'] == r['name'] for v in roles.values())
                                for r in self.tagger.roles},
                 'attendanceOn': self.attendance_on, 'enrolled': enrolled,
+                'livenessEnabled': self.liveness_enabled,
                 'knownFaces': self.facebook.roster() if self.facebook else [],
-                'faces': [{'name': f['name'], 'score': f['score']} for f in faces_out],
+                'faces': [{'name': f['name'], 'score': f['score'], 'liveness': f['liveness']}
+                          for f in faces_out],
                 'genericOn': self.generic_on, 'genericObjects': len(generic_ids)}
 
 def main():
@@ -190,8 +238,11 @@ def main():
                         watcher.attendance_on = False
                         emit({'type': 'log', 'message': str(error)[:150]})
                 continue
+            if 'livenessEnabled' in data:
+                watcher.liveness_enabled = bool(data['livenessEnabled'])
+                continue
             if 'enroll' in data:
-                watcher.pending_enroll = str(data['enroll'])[:40]
+                watcher.pending_enroll = (str(data['enroll'])[:40], time.monotonic())
                 continue
             frame = cv2.imdecode(np.frombuffer(base64.b64decode(data['frame']), np.uint8), cv2.IMREAD_COLOR)
             if frame is None:

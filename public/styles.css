@@ -121,6 +121,8 @@ footer { min-height: 60px; display: flex; justify-content: space-between; align-
 .attendance-setup code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: .78rem; }
 .toggle-row { display: flex; align-items: center; gap: 9px; margin: 12px 0; font-size: .88rem; cursor: pointer; }
 .toggle-row input { width: 16px; height: 16px; accent-color: var(--accent); }
+.schedule-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; align-items: center; margin-top: 12px; font-size: .8rem; }
+.schedule-fields input { min-width: 0; padding: 8px 10px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-bright); border-radius: 8px; }
 
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
 

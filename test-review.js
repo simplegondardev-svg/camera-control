@@ -6,7 +6,8 @@ const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 const { EvidenceStore } = require('./evidence');
 const { chromium } = require('playwright-core');
-const ffmpeg = 'C:\\Program Files\\ffmpeg-master-latest-win64-gpl-shared\\bin\\ffmpeg.exe';
+const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
+const ffprobe = process.env.FFPROBE_PATH || 'ffprobe';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camera-review-test-'));
 const image = fs.readFileSync(path.join(__dirname, '.venv/Lib/site-packages/ultralytics/assets/bus.jpg'));
 const base = 'http://127.0.0.1:4189';
@@ -38,7 +39,7 @@ async function main() {
   assert.equal(record.mediaStatus, 'ready');
   assert.equal(record.partial, true);
   assert(record.media['snapshot_pickup.jpg']);
-  const probe = JSON.parse(execFileSync(ffmpeg.replace('ffmpeg.exe', 'ffprobe.exe'), ['-v', 'error', '-show_entries', 'stream=codec_name,width,height', '-of', 'json', path.join(root,id,'clip.mp4')], { encoding: 'utf8', windowsHide: true }));
+  const probe = JSON.parse(execFileSync(ffprobe, ['-v', 'error', '-show_entries', 'stream=codec_name,width,height', '-of', 'json', path.join(root,id,'clip.mp4')], { encoding: 'utf8', windowsHide: true }));
   assert.equal(probe.streams[0].codec_name, 'h264');
   // Simulate a process exit before encoding: recover the persisted JPEG journal.
   store = new EvidenceStore(root, ffmpeg);

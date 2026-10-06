@@ -4,6 +4,14 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const { EvidenceStore } = require('./evidence');
+const {
+  AttendanceStore,
+  DEFAULT_ATTENDANCE_END_TIME,
+  DEFAULT_ATTENDANCE_START_TIME,
+  isAttendanceWindowActive,
+  isValidAttendanceTime,
+  normalizeAttendanceSchedule,
+} = require('./attendance');
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.PORT || 4173);
@@ -13,8 +21,9 @@ const ROLES_FILE = path.join(__dirname, "roles-config.json");
 const ATTENDANCE_FILE = path.join(__dirname, "attendance-config.json");
 const GENERIC_FILE = path.join(__dirname, "generic-config.json");
 const DEFAULT_URL = "rtsp://192.168.1.2:8554";
-const FFMPEG = "C:\\Program Files\\ffmpeg-master-latest-win64-gpl-shared\\bin\\ffmpeg.exe";
+const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 const evidence = new EvidenceStore(process.env.CAMERA_DATA_DIR || path.join(__dirname, 'clips'), FFMPEG);
+const attendanceStore = new AttendanceStore(path.join(__dirname, 'attendance-records.json'));
 
 const clients = new Set();
 let ffmpeg = null;
@@ -31,13 +40,33 @@ let streamWatchdog = null;
 let desiredUrl = null;
 let wantsDetection = false;
 let roles = readRoles();
-let attendanceEnabled = readAttendance();
+let attendanceConfig = readAttendanceConfig();
+let attendanceEnabled = attendanceConfig.enabled;
+let livenessEnabled = attendanceConfig.livenessEnabled;
 let genericEnabled = readGeneric();
 let lastEnroll = null;
+let attendanceError = null;
 
-function readAttendance() {
-  try { return JSON.parse(fs.readFileSync(ATTENDANCE_FILE, "utf8")).enabled === true; }
-  catch { return false; }
+function readAttendanceConfig() {
+  try {
+    const config = JSON.parse(fs.readFileSync(ATTENDANCE_FILE, "utf8"));
+    const schedule = normalizeAttendanceSchedule(
+      config.attendanceStartTime,
+      config.attendanceEndTime,
+    );
+    return {
+      enabled: config.enabled === true,
+      livenessEnabled: config.livenessEnabled === true,
+      ...schedule,
+    };
+  } catch {
+    return {
+      enabled: false,
+      livenessEnabled: false,
+      attendanceStartTime: DEFAULT_ATTENDANCE_START_TIME,
+      attendanceEndTime: DEFAULT_ATTENDANCE_END_TIME,
+    };
+  }
 }
 
 function readGeneric() {
@@ -110,6 +139,7 @@ function startDetection() {
       detectorReady = true;
       sendRoles(worker);
       sendLine(worker, { attendance: attendanceEnabled });
+      sendLine(worker, { livenessEnabled });
       sendLine(worker, { generic: genericEnabled });
       detection = { state: "running", message: "Waiting for a camera frame" };
     } else if (result.type === "frame") {
@@ -117,6 +147,19 @@ function startDetection() {
       detectorBusy = false;
       frameErrors = 0;
       const { frame, type, events = [], enrolled, ...metrics } = result;
+      if (attendanceEnabled) {
+        try {
+          attendanceStore.observe(metrics.faces, {
+            livenessEnabled,
+            attendanceStartTime: attendanceConfig.attendanceStartTime,
+            attendanceEndTime: attendanceConfig.attendanceEndTime,
+          });
+          attendanceError = null;
+        } catch (error) {
+          attendanceError = error.message;
+          console.error('Attendance persistence failed:', error);
+        }
+      }
       for (const event of events) evidence.begin(event, analyzedFrame || currentFrame);
       if (enrolled) lastEnroll = { ...enrolled, at: new Date().toISOString() };
       detection = { state: "running", message: "Detection active", updatedAt: new Date().toISOString(), ...metrics, enrollStatus: lastEnroll };
@@ -365,7 +408,26 @@ const server = http.createServer(async (request, response) => {
   }
 
   if (pathname === "/api/status" && request.method === "GET") {
-    return writeJson(response, 200, { ...status, detection, attendanceEnabled, genericEnabled });
+    const attendanceWindowActive = isAttendanceWindowActive(
+      new Date(),
+      attendanceConfig.attendanceStartTime,
+      attendanceConfig.attendanceEndTime,
+    );
+    return writeJson(response, 200, {
+      ...status,
+      detection,
+      attendanceEnabled,
+      livenessEnabled,
+      attendanceStartTime: attendanceConfig.attendanceStartTime,
+      attendanceEndTime: attendanceConfig.attendanceEndTime,
+      attendanceWindowActive,
+      attendanceRecordingAllowed: attendanceEnabled && attendanceWindowActive,
+      genericEnabled,
+    });
+  }
+
+  if (pathname === "/api/attendance/records" && request.method === "GET") {
+    return writeJson(response, 200, { records: attendanceStore.list(), error: attendanceError });
   }
 
   if (pathname === "/api/roles" && request.method === "GET") {
@@ -398,10 +460,47 @@ const server = http.createServer(async (request, response) => {
   if (pathname === "/api/attendance" && request.method === "POST") {
     try {
       const body = await readBody(request);
-      attendanceEnabled = body.enabled === true;
-      fs.writeFileSync(ATTENDANCE_FILE, JSON.stringify({ enabled: attendanceEnabled }, null, 2));
-      if (detector && detectorReady) sendLine(detector, { attendance: attendanceEnabled });
-      return writeJson(response, 200, { enabled: attendanceEnabled });
+      const hasEnabled = typeof body.enabled === 'boolean';
+      const hasLiveness = typeof body.livenessEnabled === 'boolean';
+      const hasStart = Object.hasOwn(body, 'attendanceStartTime');
+      const hasEnd = Object.hasOwn(body, 'attendanceEndTime');
+      if (hasStart && !isValidAttendanceTime(body.attendanceStartTime)) {
+        return writeJson(response, 400, { error: 'attendanceStartTime must use 24-hour HH:mm format' });
+      }
+      if (hasEnd && !isValidAttendanceTime(body.attendanceEndTime)) {
+        return writeJson(response, 400, { error: 'attendanceEndTime must use 24-hour HH:mm format' });
+      }
+      if (!hasEnabled && !hasLiveness && !hasStart && !hasEnd) {
+        return writeJson(response, 400, {
+          error: 'Provide enabled, livenessEnabled, attendanceStartTime, or attendanceEndTime',
+        });
+      }
+      const nextEnabled = hasEnabled ? body.enabled : attendanceEnabled;
+      const nextLivenessEnabled = hasLiveness ? body.livenessEnabled : livenessEnabled;
+      const proposedStart = hasStart
+        ? body.attendanceStartTime
+        : attendanceConfig.attendanceStartTime;
+      const proposedEnd = hasEnd
+        ? body.attendanceEndTime
+        : attendanceConfig.attendanceEndTime;
+      if (proposedStart >= proposedEnd) {
+        return writeJson(response, 400, { error: 'Attendance start time must be earlier than end time' });
+      }
+      const schedule = normalizeAttendanceSchedule(proposedStart, proposedEnd);
+      const nextConfig = {
+        enabled: nextEnabled,
+        livenessEnabled: nextLivenessEnabled,
+        ...schedule,
+      };
+      fs.writeFileSync(ATTENDANCE_FILE, JSON.stringify(nextConfig, null, 2));
+      attendanceEnabled = nextEnabled;
+      livenessEnabled = nextLivenessEnabled;
+      attendanceConfig = nextConfig;
+      if (detector && detectorReady) {
+        if (typeof body.enabled === 'boolean') sendLine(detector, { attendance: attendanceEnabled });
+        if (typeof body.livenessEnabled === 'boolean') sendLine(detector, { livenessEnabled });
+      }
+      return writeJson(response, 200, nextConfig);
     } catch (error) {
       return writeJson(response, 400, { error: error.message });
     }

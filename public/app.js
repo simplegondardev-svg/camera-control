@@ -5,11 +5,14 @@ const streamImage = $('#streamImage'), viewer = $('#viewer');
 const startDetection = $('#startDetection'), stopDetection = $('#stopDetection');
 const dialog = $('#reviewDialog'), video = $('#reviewVideo');
 const roleForm = $('#roleForm'), roleList = $('#roleList');
-const attendanceToggle = $('#attendanceToggle'), enrollForm = $('#enrollForm');
+const attendanceToggle = $('#attendanceToggle'), livenessToggle = $('#livenessToggle'), enrollForm = $('#enrollForm');
+const attendanceStartInput = $('#attendanceStartTime'), attendanceEndInput = $('#attendanceEndTime');
 const genericToggle = $('#genericToggle');
 let previousState = 'idle', alerts = [], selectedId = null, alertSignature = '';
 let cameraAction = false, detectionAction = false, sourceDirty = false;
 let roles = [];
+let savedAttendanceStartTime = '06:00', savedAttendanceEndTime = '22:00';
+let attendanceScheduleError = '';
 
 async function fetchJson(url, options) {
   const response = await fetch(url, { ...options, signal: AbortSignal.timeout(10000) });
@@ -43,9 +46,7 @@ function renderStatus(status) {
   $('#detectionStatus').textContent = stale ? 'Waiting for fresh analysis…' : analysis.message;
   $('#detectionMetrics').textContent = analysis.updatedAt && !stale
     ? analysis.people + ' now · peak ' + (analysis.peoplePeak || 0) + ' · ' + (analysis.uniquePeople || 0) + ' seen · ' +
-      analysis.objects + ' objects · ' + analysis.wrists + ' wrists · ' + (analysis.inHand || 0) + ' in hand' +
-      (analysis.genericObjects ? ' (+' + analysis.genericObjects + ' unnamed)' : '') + ' · ' +
-      analysis.inferenceMs + ' ms/frame. In hand: ' + ((analysis.nearby || []).join(', ') || 'none') + '.' +
+      analysis.wrists + ' wrists · ' + analysis.inferenceMs + ' ms/frame.' +
       ((analysis.groups && analysis.groups.length)
         ? ' Together: ' + analysis.groups.map(g => g.map(id => '#' + id).join('+')).join(', ') + '.'
         : '') +
@@ -147,6 +148,32 @@ attendanceToggle.addEventListener('change', async () => {
   try { await post('/api/attendance', { enabled: attendanceToggle.checked }); }
   catch (error) { $('#attendanceStatus').textContent = error.message; attendanceToggle.checked = !attendanceToggle.checked; }
 });
+livenessToggle.addEventListener('change', async () => {
+  try { await post('/api/attendance', { livenessEnabled: livenessToggle.checked }); }
+  catch (error) {
+    livenessToggle.checked = !livenessToggle.checked;
+    $('#livenessMode').textContent = 'Could not save liveness setting: ' + error.message;
+  }
+});
+attendanceStartInput.addEventListener('change', () => saveAttendanceTime('attendanceStartTime'));
+attendanceEndInput.addEventListener('change', () => saveAttendanceTime('attendanceEndTime'));
+async function saveAttendanceTime(field) {
+  const inputElement = field === 'attendanceStartTime' ? attendanceStartInput : attendanceEndInput;
+  try {
+    const result = await post('/api/attendance', { [field]: inputElement.value });
+    savedAttendanceStartTime = result.attendanceStartTime;
+    savedAttendanceEndTime = result.attendanceEndTime;
+    attendanceScheduleError = '';
+    $('#attendanceScheduleStatus').textContent =
+      'Attendance schedule: ' + savedAttendanceStartTime + '–' + savedAttendanceEndTime + '.';
+  } catch (error) {
+    inputElement.value = field === 'attendanceStartTime'
+      ? savedAttendanceStartTime
+      : savedAttendanceEndTime;
+    attendanceScheduleError = 'Could not save attendance schedule: ' + error.message;
+    $('#attendanceScheduleStatus').textContent = attendanceScheduleError;
+  }
+}
 enrollForm.addEventListener('submit', async event => {
   event.preventDefault();
   const name = $('#enrollName').value.trim();
@@ -162,16 +189,74 @@ function renderAttendance(status) {
   if (document.activeElement !== attendanceToggle) {
     attendanceToggle.checked = analysis.attendanceOn ?? status.attendanceEnabled ?? false;
   }
+  const attendanceOn = status.attendanceEnabled === true;
+  $('#attendanceEnabledStatus').textContent = attendanceOn
+    ? 'Attendance recording enabled.'
+    : 'Attendance recording disabled.';
+  const livenessOn = status.livenessEnabled === true;
+  if (document.activeElement !== livenessToggle) livenessToggle.checked = livenessOn;
+  $('#livenessMode').textContent = livenessOn
+    ? 'Liveness screening ON — recognition and attendance require a stable LIVE result.'
+    : 'Liveness screening OFF — recognition does not verify that a face is live.';
+  if (typeof status.attendanceStartTime === 'string' &&
+      typeof status.attendanceEndTime === 'string') {
+    savedAttendanceStartTime = status.attendanceStartTime;
+    savedAttendanceEndTime = status.attendanceEndTime;
+    if (document.activeElement !== attendanceStartInput) {
+      attendanceStartInput.value = savedAttendanceStartTime;
+    }
+    if (document.activeElement !== attendanceEndInput) {
+      attendanceEndInput.value = savedAttendanceEndTime;
+    }
+    $('#attendanceScheduleStatus').textContent = attendanceScheduleError ||
+      'Attendance schedule: ' + savedAttendanceStartTime + '–' + savedAttendanceEndTime + '.';
+  }
+  $('#attendanceWindowStatus').textContent = status.attendanceWindowActive
+    ? status.attendanceRecordingAllowed
+      ? 'Inside attendance window; recording is allowed while detection is active.'
+      : 'Inside attendance window; attendance recording is disabled by the attendance control.'
+    : 'Outside attendance window; recognized faces do not create or update attendance records.';
   if (document.activeElement !== genericToggle) {
     genericToggle.checked = analysis.genericOn ?? status.genericEnabled ?? false;
   }
   const known = analysis.knownFaces || [];
   $('#enrolledList').textContent = known.length ? 'Enrolled: ' + known.join(', ') : 'No faces enrolled yet.';
-  const recognized = (analysis.faces || []).map(f => f.name || 'Unknown');
+  const faceStates = {
+    'DISABLED': 'Liveness disabled',
+    'CHECKING': 'Checking liveness',
+    'SPOOF / REJECTED': 'Spoof / Rejected',
+    'INCONCLUSIVE': 'Liveness inconclusive',
+  };
+  const recognized = (analysis.faces || []).map(f =>
+    ['LIVE', 'DISABLED'].includes(f.liveness) ? f.name || 'Unknown' : faceStates[f.liveness] || 'Checking liveness');
   const enroll = analysis.enrollStatus;
   if (enroll && Date.now() - Date.parse(enroll.at) < 6000) $('#attendanceStatus').textContent = enroll.message;
   else if (analysis.attendanceOn) $('#attendanceStatus').textContent = recognized.length ? 'Recognizing: ' + recognized.join(', ') : 'Face recognition on — no face in view.';
   else if (status.state === 'connected') $('#attendanceStatus').textContent = 'Enable face recognition, or enrol a new face.';
+}
+
+function renderAttendanceRecords(result) {
+  const records = result.records || [];
+  const list = $('#attendanceRecords');
+  const formatTime = value => value ? new Date(value).toLocaleTimeString() : '—';
+  list.replaceChildren(...records.slice(0, 10).map(record =>
+    textElement('li', record.person + ' · ' + record.date + ' · In ' + formatTime(record.arrival) +
+      ' · Out ' + formatTime(record.departure))));
+  if (!records.length && !result.error) {
+    list.append(textElement('li', 'No attendance records yet.'));
+  }
+  $('#attendanceRecordsStatus').textContent = result.error
+    ? 'Attendance storage error: ' + result.error
+    : records.length > 10 ? 'Showing the latest 10 of ' + records.length + ' records.' : '';
+}
+async function refreshAttendanceRecords() {
+  try {
+    renderAttendanceRecords(await fetchJson('/api/attendance/records'));
+  } catch (error) {
+    $('#attendanceRecordsStatus').textContent = 'Attendance history unavailable: ' + error.message;
+  } finally {
+    setTimeout(refreshAttendanceRecords, 5000);
+  }
 }
 
 function textElement(tag, content) {
@@ -277,4 +362,5 @@ async function poll() {
 }
 fetchJson('/api/config').then(config => { if (!sourceDirty) input.value = config.rtspUrl; })
   .catch(() => { if (!sourceDirty) input.value = 'rtsp://192.168.1.2:8554'; });
+refreshAttendanceRecords();
 poll();

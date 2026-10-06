@@ -49,6 +49,32 @@ class ExtrasTests(unittest.TestCase):
             self.assertEqual(book.recognize(frame), [])
             self.assertFalse(book.enroll('Synthetic test',frame)['ok'])
             self.assertEqual(book.roster(), [])
+            self.assertIsNone(book.liveness_net)
+            book._ensure_liveness_model().setInput(np.zeros((1,3,128,128),np.float32))
+            self.assertEqual(book.liveness_net.forward().shape, (1,2))
+
+    def test_liveness_disabled_enrollment_does_not_require_anti_spoof_model(self):
+        with tempfile.TemporaryDirectory(prefix='camera-face-test-') as folder:
+            missing_liveness = Path(folder) / 'missing-anti-spoof.onnx'
+            book = FaceBook(
+                'models/face_detection_yunet.onnx',
+                'models/face_recognition_sface.onnx',
+                Path(folder) / 'db.json',
+                liveness_path=missing_liveness,
+            )
+            face = np.array([10,20,30,40], dtype=np.float32)
+            book._detect = lambda frame: [face]
+            book._embed = lambda frame, detected_face: np.ones((1,128), np.float32)
+
+            result = book.enroll(
+                'Fixture',
+                np.zeros((160,160,3),np.uint8),
+                liveness_enabled=False,
+            )
+
+            self.assertTrue(result['ok'])
+            self.assertEqual(book.roster(), ['Fixture'])
+            self.assertIsNone(book.liveness_net)
 
     def test_synthetic_embeddings_persist_forget_and_limit_samples(self):
         # Deliberately bypass real face capture: vectors are fabricated, not biometrics.
@@ -58,25 +84,53 @@ class ExtrasTests(unittest.TestCase):
             book.people = {}
             book._detect = lambda frame: [np.array([0,0,20,20])]
             book._embed = lambda frame,face: np.ones((1,128),np.float32)
-            for _ in range(7): self.assertTrue(book.enroll('Fixture',None)['ok'])
+            self.assertFalse(book.enroll('Fixture',None)['ok'])
+            self.assertFalse(book.enroll('Fixture',None,liveness='DISABLED')['ok'])
+            for _ in range(7): self.assertTrue(book.enroll('Fixture',None,liveness='LIVE')['ok'])
             self.assertEqual(len(book.people['Fixture']),5)
             book.people = {}; book._load()
             self.assertEqual(book.roster(), ['Fixture'])
             self.assertTrue(book.forget('Fixture'))
             book._load(); self.assertEqual(book.roster(), [])
 
-    def test_reproduce_multiple_face_enrollment_ambiguity(self):
+    def test_multiple_faces_are_rejected_during_enrollment(self):
         with tempfile.TemporaryDirectory(prefix='camera-face-test-') as folder:
             book = FaceBook.__new__(FaceBook)
             book.db_path = Path(folder)/'db.json'; book.people = {}
             book._detect = lambda frame: [np.array([0,0,20,20]), np.array([50,0,60,60])]
-            selected = []
+            embedded = []
             def embed(frame,face):
-                selected.append(face.tolist()); return np.ones((1,128),np.float32)
+                embedded.append(face.tolist()); return np.ones((1,128),np.float32)
             book._embed = embed
-            result = book.enroll('Requested name',None)
-            self.assertTrue(result['ok'])
-            self.assertEqual(selected[0], [50,0,60,60])
-            print('CONFIRMED ISSUE: enrollment accepts multiple faces and silently chooses the largest.')
+            result = book.enroll('Requested name',None,liveness='LIVE')
+            self.assertFalse(result['ok'])
+            self.assertIn('Multiple faces detected', result['message'])
+            self.assertEqual(embedded, [])
+            self.assertEqual(book.roster(), [])
+
+    def test_enrollment_requires_exactly_one_face(self):
+        with tempfile.TemporaryDirectory(prefix='camera-face-test-') as folder:
+            book = FaceBook.__new__(FaceBook)
+            book.db_path = Path(folder)/'db.json'; book.people = {}
+            embedded = []
+            book._embed = lambda frame, face: embedded.append(face.tolist()) or np.ones((1,128),np.float32)
+
+            book._detect = lambda frame: []
+            no_face = book.enroll('Fixture',None,liveness='LIVE')
+            self.assertFalse(no_face['ok'])
+            self.assertIn('No face detected', no_face['message'])
+
+            only_face = np.array([10,20,30,40])
+            book._detect = lambda frame: [only_face]
+            one_face = book.enroll('Fixture',None,liveness='LIVE')
+            self.assertTrue(one_face['ok'])
+            self.assertEqual(embedded, [only_face.tolist()])
+
+            book._detect = lambda frame: [only_face, np.array([50,60,70,80])]
+            multiple_faces = book.enroll('Another fixture',None,liveness='LIVE')
+            self.assertFalse(multiple_faces['ok'])
+            self.assertIn('Multiple faces detected', multiple_faces['message'])
+            self.assertEqual(len(embedded), 1)
+            self.assertEqual(book.roster(), ['Fixture'])
 
 if __name__ == '__main__': unittest.main()
