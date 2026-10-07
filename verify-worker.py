@@ -31,4 +31,14 @@ assert decoded.shape == original.shape, 'Annotations must preserve the complete 
 assert frame['people'] > 0, 'Expected people in bundled sample'
 assert frame['objects'] > 0, 'Expected objects in bundled sample'
 assert frame['wrists'] > 0, 'Expected visible wrists in bundled sample'
-print('PASS: real model inference, wrists, objects and full frame dimensions', frame)
+_, baseline_jpeg = cv2.imencode('.jpg', original, [cv2.IMWRITE_JPEG_QUALITY, 80])
+baseline = cv2.imdecode(baseline_jpeg, cv2.IMREAD_COLOR)
+near_color = lambda image, color: np.max(
+    np.abs(image.astype(np.int16) - np.array(color, dtype=np.int16)), axis=2) <= 36
+person_overlay_pixels = np.count_nonzero(near_color(decoded, (80, 220, 140)))
+person_baseline_pixels = np.count_nonzero(near_color(baseline, (80, 220, 140)))
+object_overlay_pixels = np.count_nonzero(near_color(decoded, (240, 180, 70)))
+object_baseline_pixels = np.count_nonzero(near_color(baseline, (240, 180, 70)))
+assert person_overlay_pixels > person_baseline_pixels + 20, 'Expected visible person boxes/labels'
+assert object_overlay_pixels <= object_baseline_pixels + 20, 'Generic object boxes/labels must stay off the live overlay'
+print('PASS: real model inference, person overlay, hidden object overlay, wrists and full frame dimensions', frame)

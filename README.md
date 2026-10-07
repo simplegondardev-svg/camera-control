@@ -56,10 +56,59 @@ The preview automatically retries a lost camera connection every five seconds
 and resumes detection if it was previously enabled. A new connection creates
 fresh tracking identities.
 
+## Face attendance and liveness
+
+Face attendance is opt-in. Enrol only consenting people. The attendance panel
+has a separate liveness-screening control; it defaults to OFF when
+`livenessEnabled` is absent from `attendance-config.json`. With screening OFF,
+YuNet faces go directly to SFace matching and results are marked `DISABLED`.
+This setting does not establish that a person is live and should be treated as
+a development/testing mode. With screening ON, the local Open Model Zoo
+`anti-spoof-mn3` ONNX model gates SFace and attendance as before. With screening
+OFF, enrollment does not run the anti-spoof model but still requires exactly one
+YuNet-detected face. With screening ON, enrollment requires stable live evidence
+and exactly one detected face. Attendance still uses the existing
+first-recognition arrival / later recognition departure rules.
+
+Attendance recording is scheduled for a same-day local-time window from
+`attendanceStartTime` (inclusive) to `attendanceEndTime` (exclusive). The
+defaults are `06:00` and `22:00`; these can be changed in the attendance panel.
+Outside the window, face recognition and camera processing continue when
+enabled, but recognized faces cannot create or update attendance records.
+Incomplete recognition stability is cleared while the window is closed.
+Attendance history is retained across window closure and local calendar-day
+rollover. The schedule does not start or stop the camera or recognition worker.
+
+The anti-spoof model is required at
+`models/face_anti_spoof_mn3.onnx`. It is a 12,270,179-byte MobileNetV3 model
+trained on CelebA-Spoof, published by
+[Open Model Zoo](https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/anti-spoof-mn3).
+The official file is
+[anti-spoof-mn3.onnx](https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/anti-spoof-mn3/anti-spoof-mn3.onnx);
+its published SHA-384 is
+`6de4534964b723397b3e8c995cadcf43bc007cc2f9930b95ae25f76adccece5d1d4d058d0b15117b9e4a9f758424f92a`.
+It runs locally through the existing OpenCV DNN dependency; no package or
+cloud service is added. Output class 0 means real/live and class 1 means spoof.
+
+The face crop follows the publisher's reference demo: 1.1x width, 1.05x height,
+and cubic resize. The publisher's reference spoof decision boundary is 0.4; this
+gate requires at least 0.60 confidence for either the live or spoof class and
+treats the middle range as inconclusive. At least three live results among the
+latest five face samples, spanning at least one second, are required, with no
+gap over 2.5 seconds. An inconclusive frame cannot proceed to SFace or
+attendance; a confident spoof result clears the live evidence window. Malformed
+or failed model results fail closed. The model reports
+an ACER of 3.81% on its published benchmark, but this passive RGB check can
+still accept presentation attacks or reject real people under different
+cameras, lighting, displays, or image quality. It is a risk-reduction aid, not
+proof of liveness or identity.
+
 ## Setup on another Windows computer
 
-Install Node.js 20+, Python, and FFmpeg. Update the FFmpeg path in `server.js`
-for your installation. Then run:
+Install Node.js 20+, Python, and FFmpeg. Both `ffmpeg` and `ffprobe` must be
+available on your system `PATH`. To use executables outside `PATH`, set
+`FFMPEG_PATH` and `FFPROBE_PATH` to their executable paths before starting the
+application or running the review test. Then run:
 
 ```powershell
 python -m venv .venv
@@ -68,7 +117,9 @@ python -m venv .venv
 
 Put the official [YOLO11 nano detection model](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt)
 and [YOLO11 nano pose model](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt)
-in `models/`. Runtime video processing is local. Setup requires internet downloads.
+in `models/`. Obtain the YuNet/SFace files expected by `attendance.py` and the
+liveness model described above in the same directory. Runtime video processing
+is local. Setup requires internet downloads.
 Review the [Ultralytics license](https://www.ultralytics.com/license) before commercial distribution.
 
 For browser validation, run `npm install` to install the development-only
@@ -81,7 +132,12 @@ Playwright library; the review test uses the existing Microsoft Edge installatio
 stopping, and restarting detection. It leaves detection running for manual testing.
 `.venv/Scripts/python verify-worker.py` checks the real models against their
 bundled sample, including wrist detections and preservation of frame dimensions.
+`npm run test:liveness` exercises both recognition modes, model-result
+classification, stability, fail-closed behavior, and the SFace gate.
 `npm run test:tracking` covers temporal rules without a camera.
+`npm run test:attendance` covers the daily attendance rules and accepts either
+`LIVE` or explicitly `DISABLED` face results only when they match the
+configured liveness mode.
 `npm run test:review` uses isolated temporary fixtures to validate encoding,
 interrupted recovery, playback/seek, review persistence, API errors, and the UI.
 

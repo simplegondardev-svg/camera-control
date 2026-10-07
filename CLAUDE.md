@@ -12,8 +12,9 @@ occlusion and object-ID changes remain imperfect.
 The app also includes opt-in extras beyond the anonymous concealment pipeline:
 colour-tag role labels, foot-traffic/grouping analytics, and an opt-in face
 recognition attendance feature. Face recognition is biometric and off by
-default; enrol only people who consent, and note there is no liveness check
-yet. Enrolled face data stays local in `face-db.json` (gitignored).
+default; enrol only people who consent. Passive liveness screening is used
+before SFace and attendance, but is not a guarantee against presentation attacks.
+Enrolled face data stays local in `face-db.json` (gitignored).
 
 ## Implemented components
 
@@ -24,9 +25,10 @@ yet. Enrolled face data stays local in `face-db.json` (gitignored).
 - `event_tracker.py`: camera-independent temporal rules with deterministic tests.
 - `presence.py`: anonymous foot-traffic counts and "hanging together" grouping.
 - `roles.py`: colour-tag role labelling (assign a tag colour to a role).
-- `attendance.py`: opt-in face enrolment/recognition via OpenCV YuNet + SFace;
-  stored locally in `face-db.json`. Toggled on/off from the dashboard. No
-  liveness check; results are an aid, not authority.
+- `attendance.py`: opt-in face enrolment/recognition via OpenCV YuNet + SFace,
+  gated by local Open Model Zoo anti-spoof-mn3 inference and multi-frame
+  stability. Embeddings stay in `face-db.json`; toggle from the dashboard.
+  Liveness results are an aid, not authority.
 - `evidence.js`: durable local events, pre/post video, snapshot storage, H.264
   encoding, interrupted capture recovery, persistent notes/review decisions.
 - `public/`: responsive full-frame portrait/landscape viewer, camera/detection
