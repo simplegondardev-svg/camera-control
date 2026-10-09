@@ -20,6 +20,7 @@ const CONFIG_FILE = path.join(__dirname, "camera-config.json");
 const ROLES_FILE = path.join(__dirname, "roles-config.json");
 const ATTENDANCE_FILE = path.join(__dirname, "attendance-config.json");
 const GENERIC_FILE = path.join(__dirname, "generic-config.json");
+const FACESTATE_FILE = path.join(__dirname, "facestate-config.json");
 const DEFAULT_URL = "rtsp://192.168.1.2:8554";
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 const evidence = new EvidenceStore(process.env.CAMERA_DATA_DIR || path.join(__dirname, 'clips'), FFMPEG);
@@ -44,6 +45,7 @@ let attendanceConfig = readAttendanceConfig();
 let attendanceEnabled = attendanceConfig.enabled;
 let livenessEnabled = attendanceConfig.livenessEnabled;
 let genericEnabled = readGeneric();
+let faceStateEnabled = readFaceState();
 let lastEnroll = null;
 let attendanceError = null;
 
@@ -71,6 +73,11 @@ function readAttendanceConfig() {
 
 function readGeneric() {
   try { return JSON.parse(fs.readFileSync(GENERIC_FILE, "utf8")).enabled === true; }
+  catch { return false; }
+}
+
+function readFaceState() {
+  try { return JSON.parse(fs.readFileSync(FACESTATE_FILE, "utf8")).enabled === true; }
   catch { return false; }
 }
 
@@ -119,17 +126,19 @@ function startDetection() {
   detection = { state: "loading", message: "Loading detection models…" };
   const worker = spawn(path.join(__dirname, ".venv/Scripts/python.exe"), ["-u", path.join(__dirname, "detection.py")], { cwd: __dirname, windowsHide: true });
   let frameErrors = 0;
+  let stderrTail = "";
   detector = worker;
-  const fail = () => {
+  const fail = (extra) => {
     if (detector !== worker) return;
+    const reason = String(extra || stderrTail).trim().split(/\r?\n/).filter(Boolean).at(-1);
     stopDetection();
-    detection = { state: "error", message: "Detection stopped. Check Python dependencies and model files, then retry." };
+    detection = { state: "error", message: "Detection stopped. Check Python dependencies and model files, then retry." + (reason ? ` (${reason.slice(0, 160)})` : "") };
   };
   detectionTimer = setTimeout(fail, 60000);
-  worker.on("error", fail);
-  worker.on("exit", fail);
+  worker.on("error", (error) => fail(error.message));
+  worker.on("exit", (code) => fail(code === null ? "" : `worker exited (code ${code})`));
   worker.stdin.on("error", fail);
-  worker.stderr.on("data", () => {});
+  worker.stderr.on("data", (chunk) => { stderrTail = (stderrTail + chunk.toString()).slice(-2000); });
   readline.createInterface({ input: worker.stdout }).on("line", line => {
     if (detector !== worker) return;
     let result;
@@ -141,6 +150,7 @@ function startDetection() {
       sendLine(worker, { attendance: attendanceEnabled });
       sendLine(worker, { livenessEnabled });
       sendLine(worker, { generic: genericEnabled });
+      sendLine(worker, { faceState: faceStateEnabled });
       detection = { state: "running", message: "Waiting for a camera frame" };
     } else if (result.type === "frame") {
       clearTimeout(detectionTimer);
@@ -423,6 +433,7 @@ const server = http.createServer(async (request, response) => {
       attendanceWindowActive,
       attendanceRecordingAllowed: attendanceEnabled && attendanceWindowActive,
       genericEnabled,
+      faceStateEnabled,
     });
   }
 
@@ -452,6 +463,18 @@ const server = http.createServer(async (request, response) => {
       fs.writeFileSync(GENERIC_FILE, JSON.stringify({ enabled: genericEnabled }, null, 2));
       if (detector && detectorReady) sendLine(detector, { generic: genericEnabled });
       return writeJson(response, 200, { enabled: genericEnabled });
+    } catch (error) {
+      return writeJson(response, 400, { error: error.message });
+    }
+  }
+
+  if (pathname === "/api/facestate" && request.method === "POST") {
+    try {
+      const body = await readBody(request);
+      faceStateEnabled = body.enabled === true;
+      fs.writeFileSync(FACESTATE_FILE, JSON.stringify({ enabled: faceStateEnabled }, null, 2));
+      if (detector && detectorReady) sendLine(detector, { faceState: faceStateEnabled });
+      return writeJson(response, 200, { enabled: faceStateEnabled });
     } catch (error) {
       return writeJson(response, 400, { error: error.message });
     }

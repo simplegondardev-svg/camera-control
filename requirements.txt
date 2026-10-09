@@ -3,3 +3,4 @@ ultralytics==8.4.172
 torch==2.14.1+cpu
 torchvision==0.29.1+cpu
 lapx==0.10.0
+mediapipe==1.1.0
