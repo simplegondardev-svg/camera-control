@@ -191,13 +191,21 @@ enrollForm.addEventListener('submit', async event => {
 });
 function renderAttendance(status) {
   const analysis = status.detection || {};
+  const recognition = formatRecognitionStatus(status);
+  const recognitionOnly = status.recognitionOnlyMode === true;
   if (document.activeElement !== attendanceToggle) {
-    attendanceToggle.checked = analysis.attendanceOn ?? status.attendanceEnabled ?? false;
+    attendanceToggle.checked = recognition.enabled;
   }
-  const attendanceOn = status.attendanceEnabled === true;
-  $('#attendanceEnabledStatus').textContent = attendanceOn
-    ? 'Attendance recording enabled.'
-    : 'Attendance recording disabled.';
+  attendanceToggle.disabled = recognitionOnly;
+  livenessToggle.disabled = recognitionOnly;
+  $('#attendanceToggleLabel').textContent = recognitionOnly
+    ? 'Face recognition (read-only test mode)'
+    : 'Enable face recognition';
+  $('#enrollForm').hidden = !recognition.enrollmentAvailable;
+  $('#enrollmentModeStatus').hidden = recognition.enrollmentAvailable;
+  $('#enrollmentModeStatus').textContent = recognition.enrollmentMessage;
+  $('#attendanceEnabledStatus').textContent = recognition.settingsMessage;
+  $('#recognitionRuntimeStatus').textContent = recognition.runtimeMessage;
   const livenessOn = status.livenessEnabled === true;
   if (document.activeElement !== livenessToggle) livenessToggle.checked = livenessOn;
   $('#livenessMode').textContent = livenessOn
@@ -216,11 +224,13 @@ function renderAttendance(status) {
     $('#attendanceScheduleStatus').textContent = attendanceScheduleError ||
       'Attendance schedule: ' + savedAttendanceStartTime + '–' + savedAttendanceEndTime + '.';
   }
-  $('#attendanceWindowStatus').textContent = status.attendanceWindowActive
-    ? status.attendanceRecordingAllowed
-      ? 'Inside attendance window; recording is allowed while detection is active.'
-      : 'Inside attendance window; attendance recording is disabled by the attendance control.'
-    : 'Outside attendance window; recognized faces do not create or update attendance records.';
+  $('#attendanceWindowStatus').textContent = recognitionOnly
+    ? 'Recognition-only test mode never creates or updates attendance records.'
+    : status.attendanceWindowActive
+      ? status.attendanceRecordingAllowed
+        ? 'Inside attendance window; recording is allowed while detection is active.'
+        : 'Inside attendance window; attendance recording is disabled by the attendance control.'
+      : 'Outside attendance window; recognized faces do not create or update attendance records.';
   if (document.activeElement !== genericToggle) {
     genericToggle.checked = analysis.genericOn ?? status.genericEnabled ?? false;
   }
@@ -228,11 +238,10 @@ function renderAttendance(status) {
     faceStateToggle.checked = analysis.faceStateOn ?? status.faceStateEnabled ?? false;
   }
   const fs = analysis.faceStates;
-  $('#faceStateMetrics').textContent = (analysis.faceStateOn && fs && !stale)
-    ? 'Face states — ' + ['smiling', 'frowning', 'mouthOpen', 'eyesClosed', 'lookingAway']
-        .filter(k => fs[k]).map(k => k.replace(/([A-Z])/g, ' $1').toLowerCase() + ': ' + fs[k]).join(', ')
-        + (Object.values(fs).some(Boolean) ? '' : 'no faces in view')
-    : '';
+  $('#faceStateMetrics').textContent = formatFaceStateStatus(
+    analysis,
+    Boolean(analysis.updatedAt && Date.now()-Date.parse(analysis.updatedAt) > 5000),
+  );
   const known = analysis.knownFaces || [];
   $('#enrolledList').textContent = known.length ? 'Enrolled: ' + known.join(', ') : 'No faces enrolled yet.';
   const faceStates = {
@@ -245,8 +254,24 @@ function renderAttendance(status) {
     ['LIVE', 'DISABLED'].includes(f.liveness) ? f.name || 'Unknown' : faceStates[f.liveness] || 'Checking liveness');
   const enroll = analysis.enrollStatus;
   if (enroll && Date.now() - Date.parse(enroll.at) < 6000) $('#attendanceStatus').textContent = enroll.message;
-  else if (analysis.attendanceOn) $('#attendanceStatus').textContent = recognized.length ? 'Recognizing: ' + recognized.join(', ') : 'Face recognition on — no face in view.';
-  else if (status.state === 'connected') $('#attendanceStatus').textContent = 'Enable face recognition, or enrol a new face.';
+  else if (status.recognitionRuntime?.state === 'unavailable') {
+    $('#attendanceStatus').textContent = recognition.runtimeMessage;
+  } else if (recognitionOnly && status.recognitionRuntime?.state === 'ready') {
+    $('#attendanceStatus').textContent = recognized.length
+      ? 'Recognition-only results: ' + recognized.join(', ')
+      : 'Recognition-only mode ready — no face in view.';
+  } else if (!recognitionOnly && analysis.attendanceOn &&
+      status.recognitionRuntime?.state === 'ready') {
+    $('#attendanceStatus').textContent = recognized.length
+      ? 'Recognizing: ' + recognized.join(', ')
+      : 'Face recognition ready — no face in view.';
+  } else if (status.attendanceEnabled && status.recognitionRuntime?.state === 'initializing') {
+    $('#attendanceStatus').textContent = recognition.runtimeMessage;
+  } else if (status.state === 'connected') {
+    $('#attendanceStatus').textContent = recognitionOnly || status.attendanceEnabled
+      ? recognition.runtimeMessage
+      : 'Enable face recognition, or enrol a new face.';
+  }
 }
 
 function renderAttendanceRecords(result) {

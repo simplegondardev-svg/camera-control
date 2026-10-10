@@ -1,4 +1,5 @@
 """Deterministic tests for fail-closed face liveness gating."""
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -25,6 +26,18 @@ class FakeRecognizer:
     def match(self, embedding, reference, method):
         self.matches += 1
         return self.score
+
+
+class FakeFaceDetector:
+    def __init__(self, faces):
+        self.faces = faces
+        self.input_size = None
+
+    def setInputSize(self, size):
+        self.input_size = size
+
+    def detect(self, frame):
+        return 0 if self.faces is None else len(self.faces), self.faces
 
 
 class LivenessTests(unittest.TestCase):
@@ -130,6 +143,52 @@ class LivenessTests(unittest.TestCase):
             self.assertTrue(result['ok'])
             self.assertEqual(book.roster(), ['Alice'])
             self.assertEqual(len(book.people['Alice']), 1)
+
+    def test_detect_normalizes_none_to_an_empty_face_list(self):
+        book = FaceBook.__new__(FaceBook)
+        book.detector = FakeFaceDetector(None)
+
+        faces = book._detect(np.zeros((160, 160, 3), dtype=np.uint8))
+
+        self.assertEqual(faces, [])
+        self.assertEqual(book.detector.input_size, (160, 160))
+
+    def test_enrollment_handles_empty_numpy_detection_array(self):
+        book = FaceBook.__new__(FaceBook)
+        book.detector = FakeFaceDetector(np.empty((0, 15), dtype=np.float32))
+        book.people = {}
+        book._embed = lambda frame, face: self.fail('No-face result must not create an embedding')
+
+        result = book.enroll(
+            'Alice',
+            np.zeros((160, 160, 3), dtype=np.uint8),
+            liveness_enabled=False,
+        )
+
+        self.assertFalse(result['ok'])
+        self.assertIn('No face detected', result['message'])
+        self.assertEqual(book.people, {})
+
+    def test_enrollment_persists_one_embedding_from_numpy_detection_array(self):
+        with tempfile.TemporaryDirectory(prefix='camera-enroll-array-test-') as folder:
+            face = np.array([[10, 10, 100, 120, 1.0] + [0.0] * 10], dtype=np.float32)
+            book = FaceBook.__new__(FaceBook)
+            book.detector = FakeFaceDetector(face)
+            book.db_path = Path(folder) / 'face-db.json'
+            book.people = {}
+            book._embed = lambda frame, detected_face: np.ones((1, 128), dtype=np.float32)
+
+            result = book.enroll(
+                'Alice',
+                np.zeros((160, 160, 3), dtype=np.uint8),
+                liveness_enabled=False,
+            )
+
+            self.assertTrue(result['ok'])
+            self.assertEqual(book.roster(), ['Alice'])
+            self.assertEqual(len(book.people['Alice']), 1)
+            self.assertTrue(book.db_path.is_file())
+            self.assertEqual(len(json.loads(book.db_path.read_text())['Alice']), 1)
 
     def test_enrollment_liveness_off_rejects_zero_or_multiple_faces(self):
         book = FaceBook.__new__(FaceBook)

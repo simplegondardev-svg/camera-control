@@ -4,6 +4,13 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const { EvidenceStore } = require('./evidence');
+const { sanitizeRecognitionRuntime } = require('./recognition-runtime');
+const {
+  canEnrollFaces,
+  isRecognitionOnlyMode,
+  recordAttendanceIfAllowed,
+  validateRecognitionOnlySettings,
+} = require('./recognition-mode');
 const {
   AttendanceStore,
   DEFAULT_ATTENDANCE_END_TIME,
@@ -28,6 +35,8 @@ const attendanceStore = new AttendanceStore(path.join(__dirname, 'attendance-rec
 
 const clients = new Set();
 let ffmpeg = null;
+let ffmpegAttemptId = 0;
+let ffmpegStderrTail = "";
 let jpegBuffer = Buffer.alloc(0);
 let detector = null;
 let detectorReady = false;
@@ -37,6 +46,8 @@ let detection = { state: "off", message: "Detection is off" };
 let currentFrame = null;
 let analyzedFrame = null;
 let reconnectTimer = null;
+let reconnectAttemptId = null;
+let reconnectTimerActive = false;
 let streamWatchdog = null;
 let desiredUrl = null;
 let wantsDetection = false;
@@ -44,6 +55,13 @@ let roles = readRoles();
 let attendanceConfig = readAttendanceConfig();
 let attendanceEnabled = attendanceConfig.enabled;
 let livenessEnabled = attendanceConfig.livenessEnabled;
+const recognitionOnlyMode = isRecognitionOnlyMode(process.env);
+validateRecognitionOnlySettings(recognitionOnlyMode, attendanceEnabled, livenessEnabled);
+let recognitionRuntime = recognitionOnlyMode
+  ? { state: "stopped", message: "Recognition-only mode is active; detection is not running." }
+  : attendanceEnabled
+  ? { state: "stopped", message: "Enabled in settings; detection is not running." }
+  : { state: "disabled", message: "Face recognition is disabled in settings." };
 let genericEnabled = readGeneric();
 let faceStateEnabled = readFaceState();
 let lastEnroll = null;
@@ -118,11 +136,21 @@ function stopDetection(preserveIntent = false) {
   evidence.finishPending();
   previous?.kill();
   detection = { state: "off", message: "Detection is off" };
+  recognitionRuntime = recognitionOnlyMode
+    ? { state: "stopped", message: "Recognition-only mode is active; detection is not running." }
+    : attendanceEnabled
+    ? { state: "stopped", message: "Enabled in settings; detection is not running." }
+    : { state: "disabled", message: "Face recognition is disabled in settings." };
 }
 
 function startDetection() {
   stopDetection(true);
   wantsDetection = true;
+  recognitionRuntime = recognitionOnlyMode
+    ? { state: "initializing", message: "Recognition-only test mode is initializing." }
+    : attendanceEnabled
+    ? { state: "initializing", message: "Enabled in settings; initializing face recognition." }
+    : { state: "disabled", message: "Face recognition is disabled in settings." };
   detection = { state: "loading", message: "Loading detection models…" };
   const worker = spawn(path.join(__dirname, ".venv/Scripts/python.exe"), ["-u", path.join(__dirname, "detection.py")], { cwd: __dirname, windowsHide: true });
   let frameErrors = 0;
@@ -147,25 +175,32 @@ function startDetection() {
       clearTimeout(detectionTimer);
       detectorReady = true;
       sendRoles(worker);
-      sendLine(worker, { attendance: attendanceEnabled });
+      sendLine(worker, { attendance: recognitionOnlyMode ? false : attendanceEnabled });
       sendLine(worker, { livenessEnabled });
       sendLine(worker, { generic: genericEnabled });
       sendLine(worker, { faceState: faceStateEnabled });
+      sendLine(worker, { recognitionOnly: recognitionOnlyMode });
       detection = { state: "running", message: "Waiting for a camera frame" };
+    } else if (result.type === "recognition_status") {
+      recognitionRuntime = sanitizeRecognitionRuntime(result.recognitionRuntime);
     } else if (result.type === "frame") {
       clearTimeout(detectionTimer);
       detectorBusy = false;
       frameErrors = 0;
       const { frame, type, events = [], enrolled, ...metrics } = result;
-      if (attendanceEnabled) {
-        try {
+      try {
+        recordAttendanceIfAllowed(attendanceEnabled, recognitionOnlyMode, () => {
           attendanceStore.observe(metrics.faces, {
             livenessEnabled,
             attendanceStartTime: attendanceConfig.attendanceStartTime,
             attendanceEndTime: attendanceConfig.attendanceEndTime,
           });
+        });
+        if (attendanceEnabled && !recognitionOnlyMode) {
           attendanceError = null;
-        } catch (error) {
+        }
+      } catch (error) {
+        if (attendanceEnabled && !recognitionOnlyMode) {
           attendanceError = error.message;
           console.error('Attendance persistence failed:', error);
         }
@@ -229,9 +264,49 @@ function publicRtspUrl(value) {
   }
 }
 
+function sanitizeCameraDiagnostic(value) {
+  return String(value ?? "")
+    .replace(/\brtsps?:\/\/[^\s"'<>]+/gi, "[RTSP URL redacted]")
+    .replace(/([?&](?:username|user|password|passwd|pwd|token|access_token|auth|authorization|key|secret)=)[^&#\s]*/gi, "$1[redacted]")
+    .replace(/\b(authorization|proxy-authorization)\s*:\s*[^\r\n]*/gi, "$1: [redacted]")
+    .replace(/\b(bearer|basic)\s+[A-Za-z0-9+/=_-]+/gi, "$1 [redacted]");
+}
+
+function logCameraDiagnostic(event, details = {}) {
+  const safeDetails = Object.fromEntries(
+    Object.entries(details).map(([key, value]) => [
+      key,
+      typeof value === "string" ? sanitizeCameraDiagnostic(value).slice(-1200) : value,
+    ]),
+  );
+  console.info(JSON.stringify({
+    component: "camera",
+    timestamp: new Date().toISOString(),
+    event,
+    ...safeDetails,
+  }));
+}
+
+function logCameraStateTransition(from, to, attemptId, ffmpegCurrent, ffmpegWasCurrent = ffmpegCurrent) {
+  if (from === to) return;
+  logCameraDiagnostic("state.transition", { from, to, attemptId, ffmpegCurrent, ffmpegWasCurrent });
+}
+
 function stopStream(message = "Stream disconnected") {
+  const previousState = status.state;
+  const stoppedAttemptId = ffmpegAttemptId;
+  const hadCurrentFfmpeg = Boolean(ffmpeg);
   desiredUrl = null;
+  if (reconnectTimer && reconnectTimerActive) {
+    logCameraDiagnostic("retry.cancelled", {
+      attemptId: reconnectAttemptId ?? stoppedAttemptId,
+      reason: message === "Connecting…" ? "stream_replaced" : "stream_stopped",
+    });
+  }
   clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectAttemptId = null;
+  reconnectTimerActive = false;
   clearTimeout(streamWatchdog);
   stopDetection();
   if (ffmpeg) {
@@ -242,18 +317,30 @@ function stopStream(message = "Stream disconnected") {
   currentFrame = null;
   evidence.resetBuffer();
   status = { state: "idle", message, connectedAt: null, lastFrameAt: null };
+  logCameraStateTransition(previousState, status.state, stoppedAttemptId, false, hadCurrentFfmpeg);
 }
 
 function broadcastFrame(frame) {
   currentFrame = frame;
   evidence.addFrame(frame);
   clearTimeout(streamWatchdog);
-  streamWatchdog = setTimeout(reconnectStream, 15000);
+  const watchdogAttemptId = ffmpegAttemptId;
+  const watchdogProcess = ffmpeg;
+  streamWatchdog = setTimeout(() => {
+    logCameraDiagnostic("watchdog.fired", {
+      attemptId: watchdogAttemptId,
+      attemptIsCurrent: watchdogAttemptId === ffmpegAttemptId,
+      ffmpegIsCurrentChild: watchdogProcess !== null && ffmpeg === watchdogProcess,
+    });
+    reconnectStream();
+  }, 15000);
   status.lastFrameAt = new Date().toISOString();
   if (status.state !== "connected") {
+    const previousState = status.state;
     status.state = "connected";
     status.message = "Live stream connected";
     status.connectedAt = status.lastFrameAt;
+    logCameraStateTransition(previousState, status.state, ffmpegAttemptId, Boolean(ffmpeg));
     if (wantsDetection && !detector) startDetection();
   }
   if (detectorReady && detector) {
@@ -303,50 +390,132 @@ function startStream(rtspUrl) {
   const resumeDetection = wantsDetection;
   stopStream("Connecting…");
   wantsDetection = resumeDetection;
+  const attemptId = ++ffmpegAttemptId;
+  let stderrTail = "";
+  ffmpegStderrTail = "";
   desiredUrl = rtspUrl;
-  streamWatchdog = setTimeout(reconnectStream, 20000);
+  streamWatchdog = setTimeout(() => {
+    logCameraDiagnostic("watchdog.fired", {
+      attemptId,
+      attemptIsCurrent: attemptId === ffmpegAttemptId,
+      ffmpegIsCurrentChild: attemptId === ffmpegAttemptId && Boolean(ffmpeg),
+    });
+    reconnectStream();
+  }, 20000);
   status = { state: "connecting", message: "Opening camera stream…", connectedAt: null, lastFrameAt: null };
+  logCameraStateTransition("idle", status.state, attemptId, false);
 
-  ffmpeg = spawn(FFMPEG, [
-    "-hide_banner",
-    "-loglevel", "warning",
-    "-rtsp_transport", "tcp",
-    "-i", rtspUrl,
-    "-an",
-    "-vf", "fps=15,scale='min(1280,iw)':-2",
-    "-q:v", "5",
-    "-f", "image2pipe",
-    "-vcodec", "mjpeg",
-    "pipe:1",
-  ], { windowsHide: true });
+  try {
+    ffmpeg = spawn(FFMPEG, [
+      "-hide_banner",
+      "-loglevel", "warning",
+      "-rtsp_transport", "tcp",
+      "-i", rtspUrl,
+      "-an",
+      "-vf", "fps=15,scale='min(1280,iw)':-2",
+      "-q:v", "5",
+      "-f", "image2pipe",
+      "-vcodec", "mjpeg",
+      "pipe:1",
+    ], { windowsHide: true });
+  } catch (error) {
+    logCameraDiagnostic("ffmpeg.spawn_error", {
+      attemptId,
+      ffmpegCurrent: false,
+      error: error.message,
+    });
+    throw error;
+  }
 
   const processForStream = ffmpeg;
+  processForStream.on("spawn", () => {
+    logCameraDiagnostic("ffmpeg.spawn", {
+      attemptId,
+      ffmpegCurrent: ffmpeg === processForStream,
+    });
+  });
   ffmpeg.stdout.on("data", chunk => { if (ffmpeg === processForStream) extractFrames(chunk); });
   ffmpeg.stderr.on("data", (chunk) => {
     if (ffmpeg !== processForStream) return;
+    stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+    ffmpegStderrTail = stderrTail;
     const line = chunk.toString().trim().split(/\r?\n/).at(-1);
-    if (line && status.state !== "connected") status.message = line.slice(0, 180);
+    if (line && status.state !== "connected") {
+      status.message = sanitizeCameraDiagnostic(line).slice(0, 180);
+    }
   });
   ffmpeg.on("error", (error) => {
-    if (ffmpeg !== processForStream) return;
-    reconnectStream();
+    const ffmpegCurrent = ffmpeg === processForStream;
+    logCameraDiagnostic("ffmpeg.error", {
+      attemptId,
+      ffmpegCurrent,
+      error: error.message,
+    });
+    if (ffmpegCurrent) reconnectStream();
   });
-  ffmpeg.on("exit", (code) => {
-    if (ffmpeg === processForStream) {
-      reconnectStream();
-    }
+  ffmpeg.on("exit", (code, signal) => {
+    const ffmpegCurrent = ffmpeg === processForStream;
+    logCameraDiagnostic("ffmpeg.exit", { attemptId, ffmpegCurrent, code, signal });
+    if (ffmpegCurrent) reconnectStream();
+  });
+  ffmpeg.on("close", (code, signal) => {
+    logCameraDiagnostic("ffmpeg.close", {
+      attemptId,
+      ffmpegCurrent: ffmpeg === processForStream,
+      code,
+      signal,
+      stderrTail: sanitizeCameraDiagnostic(stderrTail).slice(-1024),
+    });
   });
 }
 
 function reconnectStream() {
-  if (!desiredUrl || reconnectTimer) return;
+  if (!desiredUrl || reconnectTimer) {
+    logCameraDiagnostic("retry.skipped", {
+      attemptId: ffmpegAttemptId,
+      reason: !desiredUrl ? "no_desired_url" : "timer_already_exists",
+      ffmpegCurrent: Boolean(ffmpeg),
+      retryTimerActive: reconnectTimerActive,
+    });
+    return;
+  }
   clearTimeout(streamWatchdog);
   stopDetection(true);
   const previous = ffmpeg;
+  const previousAttemptId = ffmpegAttemptId;
+  const previousState = status.state;
   ffmpeg = null;
   previous?.kill();
-  status = { state: 'reconnecting', message: 'Camera unavailable. Retrying in 5 seconds…', connectedAt: null, lastFrameAt: null };
-  reconnectTimer = setTimeout(() => { const url = desiredUrl; reconnectTimer = null; if (url) startStream(url); }, 5000);
+  const stderrSummary = sanitizeCameraDiagnostic(ffmpegStderrTail).trim();
+  status = {
+    state: "reconnecting",
+    message: "Camera unavailable. Retrying in 5 seconds…" +
+      (stderrSummary ? ` Last FFmpeg output: ${stderrSummary.slice(-300)}` : ""),
+    connectedAt: null,
+    lastFrameAt: null,
+  };
+  logCameraStateTransition(previousState, status.state, previousAttemptId, false, Boolean(previous));
+  logCameraDiagnostic("retry.scheduled", {
+    attemptId: previousAttemptId,
+    delayMs: 5000,
+    ffmpegCurrent: false,
+    ffmpegWasCurrent: Boolean(previous),
+  });
+  reconnectAttemptId = previousAttemptId;
+  reconnectTimerActive = true;
+  reconnectTimer = setTimeout(() => {
+    const url = desiredUrl;
+    reconnectTimer = null;
+    reconnectAttemptId = null;
+    reconnectTimerActive = false;
+    logCameraDiagnostic("retry.fired", {
+      attemptId: previousAttemptId,
+      currentAttemptId: ffmpegAttemptId,
+      hasDesiredUrl: Boolean(url),
+      belongsToCurrentAttempt: previousAttemptId === ffmpegAttemptId,
+    });
+    if (url) startStream(url);
+  }, 5000);
 }
 
 async function readBody(request) {
@@ -427,6 +596,8 @@ const server = http.createServer(async (request, response) => {
       ...status,
       detection,
       attendanceEnabled,
+      recognitionRuntime,
+      recognitionOnlyMode,
       livenessEnabled,
       attendanceStartTime: attendanceConfig.attendanceStartTime,
       attendanceEndTime: attendanceConfig.attendanceEndTime,
@@ -500,6 +671,11 @@ const server = http.createServer(async (request, response) => {
       }
       const nextEnabled = hasEnabled ? body.enabled : attendanceEnabled;
       const nextLivenessEnabled = hasLiveness ? body.livenessEnabled : livenessEnabled;
+      if (recognitionOnlyMode && (nextEnabled || nextLivenessEnabled)) {
+        return writeJson(response, 409, {
+          error: "Attendance and liveness settings cannot be enabled in recognition-only mode.",
+        });
+      }
       const proposedStart = hasStart
         ? body.attendanceStartTime
         : attendanceConfig.attendanceStartTime;
@@ -519,6 +695,14 @@ const server = http.createServer(async (request, response) => {
       attendanceEnabled = nextEnabled;
       livenessEnabled = nextLivenessEnabled;
       attendanceConfig = nextConfig;
+      if (!recognitionOnlyMode) {
+        recognitionRuntime = attendanceEnabled
+          ? { state: detector && detectorReady ? "initializing" : "stopped",
+              message: detector && detectorReady
+                ? "Enabled in settings; initializing face recognition."
+                : "Enabled in settings; detection is not running." }
+          : { state: "disabled", message: "Face recognition is disabled in settings." };
+      }
       if (detector && detectorReady) {
         if (typeof body.enabled === 'boolean') sendLine(detector, { attendance: attendanceEnabled });
         if (typeof body.livenessEnabled === 'boolean') sendLine(detector, { livenessEnabled });
@@ -529,6 +713,11 @@ const server = http.createServer(async (request, response) => {
     }
   }
   if (pathname === "/api/attendance/enroll" && request.method === "POST") {
+    if (!canEnrollFaces(recognitionOnlyMode)) {
+      return writeJson(response, 409, {
+        error: "Enrollment is disabled in recognition-only mode.",
+      });
+    }
     try {
       const body = await readBody(request);
       const name = String(body.name || "").trim().slice(0, 40);
@@ -572,12 +761,22 @@ const server = http.createServer(async (request, response) => {
         startStream(rtspUrl);
         return writeJson(response, 202, { ok: true, rtspUrl: publicRtspUrl(rtspUrl) });
       } catch (error) {
+        const previousState = status.state;
+        const message = sanitizeCameraDiagnostic(
+          error instanceof Error ? error.message : "Unable to start the camera stream",
+        ).slice(0, 300);
         status = {
           state: "error",
-          message: error instanceof Error ? error.message : "Unable to start the camera stream",
+          message,
           connectedAt: null,
           lastFrameAt: null,
         };
+        logCameraStateTransition(previousState, status.state, ffmpegAttemptId, Boolean(ffmpeg));
+        logCameraDiagnostic("connect.failed", {
+          attemptId: ffmpegAttemptId,
+          ffmpegCurrent: Boolean(ffmpeg),
+          error: message,
+        });
         return writeJson(response, 400, { error: status.message });
       }
     });
@@ -604,14 +803,44 @@ const server = http.createServer(async (request, response) => {
   serveStatic(request, response);
 });
 
-async function shutdown() {
+process.on("uncaughtExceptionMonitor", (error, origin) => {
+  const errorName = error instanceof Error ? error.name : typeof error;
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  const errorCode = typeof error?.code === "string" || typeof error?.code === "number"
+    ? error.code
+    : undefined;
+  logCameraDiagnostic(origin === "unhandledRejection"
+    ? "process.unhandled_rejection_fatal"
+    : "process.uncaught_exception", {
+    origin,
+    errorName,
+    errorCode,
+    errorMessage: sanitizeCameraDiagnostic(errorMessage).slice(0, 300),
+  });
+});
+
+process.on("exit", (code) => {
+  logCameraDiagnostic("process.exit", { code });
+});
+
+async function shutdown(signal) {
+  logCameraDiagnostic("shutdown.entered", { signal });
   stopStream();
   for (const client of clients) client.end();
   await evidence.close();
-  server.close(() => process.exit(0));
+  server.close(() => {
+    logCameraDiagnostic("shutdown.completed", { signal });
+    process.exit(0);
+  });
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on("SIGINT", () => {
+  logCameraDiagnostic("signal.received", { signal: "SIGINT" });
+  shutdown("SIGINT");
+});
+process.on("SIGTERM", () => {
+  logCameraDiagnostic("signal.received", { signal: "SIGTERM" });
+  shutdown("SIGTERM");
+});
 
 server.listen(PORT, HOST, () => {
   console.log(`Camera Control running at http://${HOST}:${PORT}`);

@@ -79,6 +79,18 @@ Incomplete recognition stability is cleared while the window is closed.
 Attendance history is retained across window closure and local calendar-day
 rollover. The schedule does not start or stop the camera or recognition worker.
 
+For isolated recognition testing without attendance writes, start a separate
+process with `CAMERA_RECOGNITION_ONLY=1` set in its environment. For example,
+in PowerShell run `$env:CAMERA_RECOGNITION_ONLY='1'; npm start`. This mode refuses
+to start unless both attendance and liveness are already disabled in
+`attendance-config.json`. The attendance toggle and enrollment form are disabled
+in the UI, and neither attendance records nor face enrollment data are written.
+Recognition uses only identities already present in the local `face-db.json`;
+with no enrolled identities, visible faces are reported as `Unknown`. This
+testing mode disables liveness and must not be used for access control,
+authorization, or other real-world decisions. Stop the process normally to
+leave the mode; do not set this environment variable for ordinary operation.
+
 The anti-spoof model is required at
 `models/face_anti_spoof_mn3.onnx`. It is a 12,270,179-byte MobileNetV3 model
 trained on CelebA-Spoof, published by
@@ -117,9 +129,21 @@ python -m venv .venv
 
 Put the official [YOLO11 nano detection model](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt)
 and [YOLO11 nano pose model](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt)
-in `models/`. Obtain the YuNet/SFace files expected by `attendance.py` and the
-liveness model described above in the same directory. Runtime video processing
-is local. Setup requires internet downloads.
+in `models/`. Face attendance uses the versioned OpenCV Zoo ONNX files below.
+The source is pinned to OpenCV Zoo commit
+[`47534e27c9851bb1128ccc0102f1145e27f23f98`](https://github.com/opencv/opencv_zoo/tree/47534e27c9851bb1128ccc0102f1145e27f23f98/models).
+
+| File in `models/` | Official asset | License | SHA-256 |
+| --- | --- | --- | --- |
+| `face_detection_yunet_2026may.onnx` | [YuNet](https://github.com/opencv/opencv_zoo/blob/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/face_detection_yunet_2026may.onnx) | MIT | `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0` |
+| `face_recognition_sface_2021dec.onnx` | [SFace](https://github.com/opencv/opencv_zoo/blob/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_recognition_sface/face_recognition_sface_2021dec.onnx) | Apache-2.0 | `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79` |
+
+These SHA-256 values are published in the official Git LFS pointer metadata.
+YuNet's 2026may file has dynamic input dimensions for OpenCV 5.x; the worker
+uses OpenCV's `FaceDetectorYN` and `FaceRecognizerSF` APIs. Keep the versioned
+filenames unchanged. The liveness model described above is separate and is only
+needed when liveness screening is enabled. Runtime video processing is local.
+Setup requires internet downloads.
 Review the [Ultralytics license](https://www.ultralytics.com/license) before commercial distribution.
 
 For browser validation, run `npm install` to install the development-only
@@ -138,6 +162,10 @@ classification, stability, fail-closed behavior, and the SFace gate.
 `npm run test:attendance` covers the daily attendance rules and accepts either
 `LIVE` or explicitly `DISABLED` face results only when they match the
 configured liveness mode.
+`npm run test:recognition-only` covers recognition-only settings, known and
+unknown recognition results with local model initialization, attendance-write
+suppression, and UI status reporting without camera input or identity-file
+writes.
 `npm run test:review` uses isolated temporary fixtures to validate encoding,
 interrupted recovery, playback/seek, review persistence, API errors, and the UI.
 

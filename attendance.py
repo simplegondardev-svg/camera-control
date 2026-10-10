@@ -136,6 +136,7 @@ class FaceBook:
     def roster(self):
         return sorted(self.people)
 
+
     def _detect(self, frame):
         height, width = frame.shape[:2]
         self.detector.setInputSize((width, height))
@@ -147,7 +148,7 @@ class FaceBook:
 
     def enroll(self, name, frame, liveness=None, *, liveness_enabled=True, detected_faces=None):
         faces = self._detect(frame) if detected_faces is None else detected_faces
-        if not faces:
+        if len(faces) == 0:
             return {'ok': False, 'name': name,
                     'message': 'No face detected. Enrollment requires exactly one visible face.'}
         if len(faces) > 1:
@@ -251,3 +252,17 @@ class FaceBook:
                 'face_data': face,
             })
         return results
+
+
+def recognition_initialization_error(error):
+    prefix = 'Missing face model: '
+    if isinstance(error, FileNotFoundError):
+        message = str(error)
+        if message.startswith(prefix):
+            basename = Path(message[len(prefix):]).name
+            if basename in {
+                'face_detection_yunet_2026may.onnx',
+                'face_recognition_sface_2021dec.onnx',
+            }:
+                return f'{prefix}{basename}'
+    return f'Face recognition initialization failed ({type(error).__name__})'

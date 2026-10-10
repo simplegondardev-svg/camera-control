@@ -111,8 +111,9 @@
           <section class="attendance-setup" aria-labelledby="attendanceHeading">
             <h2 id="attendanceHeading">Attendance (face recognition)</h2>
             <p class="field-note">Opt-in and biometric. Enrol only people who consent. Stores face data locally in <code>face-db.json</code>. Passive liveness screening is an additional check, not a guarantee against photo, screen, or other presentation attacks.</p>
-            <label class="toggle-row"><input type="checkbox" id="attendanceToggle" /> <span>Enable face recognition</span></label>
+            <label class="toggle-row"><input type="checkbox" id="attendanceToggle" /> <span id="attendanceToggleLabel">Enable face recognition</span></label>
             <p id="attendanceEnabledStatus" class="field-note" role="status">Attendance recording disabled.</p>
+            <p id="recognitionRuntimeStatus" class="field-note" role="status">Face recognition is disabled in settings.</p>
             <label class="toggle-row"><input type="checkbox" id="livenessToggle" /> <span>Enable liveness screening</span></label>
             <p id="livenessMode" class="field-note" role="status">Liveness screening OFF — recognition does not verify that a face is live.</p>
             <div class="schedule-fields">
@@ -123,6 +124,7 @@
             </div>
             <p id="attendanceScheduleStatus" class="field-note" role="status">Attendance schedule: 06:00–22:00.</p>
             <p id="attendanceWindowStatus" class="field-note" role="status">Checking attendance window…</p>
+            <p id="enrollmentModeStatus" class="field-note" role="status" hidden></p>
             <form id="enrollForm" class="role-form">
               <input id="enrollName" type="text" maxlength="40" placeholder="Name to enrol (face the camera)" autocomplete="off" required />
               <button class="secondary" id="enrollButton" type="submit">Enrol face</button>
@@ -179,6 +181,8 @@
         <span>No cloud upload</span>
       </footer>
     </main>
+    <script src="/face-state-status.js" defer></script>
+    <script src="/recognition-status.js" defer></script>
     <script src="/app.js" defer></script>
   </body>
 </html>
