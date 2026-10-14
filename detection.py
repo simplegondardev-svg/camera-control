@@ -19,6 +19,7 @@ from presence import PresenceMonitor
 from roles import RoleTagger
 from attendance import FaceBook
 from generic_objects import GenericObjectDetector
+from face_state import FaceStateWorker, label_for
 
 PORTABLE_CLASSES = {
     'backpack', 'umbrella', 'handbag', 'suitcase', 'sports ball', 'bottle',
@@ -43,6 +44,8 @@ class Watcher:
         self.pending_enroll = None
         self.generic = GenericObjectDetector()
         self.generic_on = False
+        self.face_state_on = False
+        self.fsw = FaceStateWorker(ROOT / 'models/face_landmarker.task')
 
     def faces(self):
         if self.facebook is None:
@@ -92,22 +95,49 @@ class Watcher:
         for tid in pickups:
             self.tracker.items[tid]['pickup'] = base64.b64encode(raw).decode()
         presence = self.presence.update(now, persons, w, h)
-        face_source = frame.copy() if self.attendance_on or self.pending_enroll is not None else frame
+        face_source = frame.copy() if self.attendance_on or self.pending_enroll is not None or self.face_state_on else frame
+        if self.face_state_on:
+            self.fsw.submit(face_source)   # background thread; never blocks this loop
+            face_states = self.fsw.get()
+        else:
+            face_states = []
         roles = self.tagger.classify(frame, persons)
         scale = max(.55, max(h, w)/1400)
         for label, box, tid in boxes:
-            if label != 'person':
-                continue
-            color = (80, 220, 140)
-            caption = f'person #{tid}'
-            if roles.get(tid):
+            state = self.tracker.items.get(tid) if label != 'person' else None
+            color = (80, 220, 140) if label == 'person' else (240, 180, 70)
+            caption = f'person #{tid}' if label == 'person' else label
+            if label == 'person' and roles.get(tid):
                 caption = f"{roles[tid]['name']} #{tid}"
                 color = roles[tid]['color']
+            if state and state['state'] in ('in_hand', 'near_hand', 'visible_away', 'set_down'):
+                caption += ' | ' + state['state'].replace('_', ' ')
+                if state['armed']:
+                    color = (40, 220, 255)
+            if state and state['state'] == 'disappeared':
+                color = (40, 40, 240)
             x1, y1, x2, y2 = box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, caption, (max(0, x1), max(25, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
+        for gid in generic_ids:
+            state = self.tracker.items.get(gid)
+            x1, y1, x2, y2 = objects[gid]['box']
+            color = (0, 170, 255)
+            caption = 'object'
+            if state and state['state'] in ('in_hand', 'near_hand', 'visible_away', 'set_down'):
+                caption += ' | ' + state['state'].replace('_', ' ')
+                if state['armed']:
+                    color = (40, 220, 255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             cv2.putText(frame, caption, (max(0, x1), max(25, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
         for x, y, _ in wrists:
             cv2.circle(frame, (x, y), 7, (255, 100, 230), -1)
+        for st in face_states:
+            x1, y1, x2, y2 = st['box']
+            fscolor = (90, 200, 230)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), fscolor, 1)
+            cv2.putText(frame, label_for(st), (max(0, x1), max(15, y1-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, fscolor, 2)
         for group in presence['groups']:
             pts = [(int((persons[p][0]+persons[p][2])/2), int((persons[p][1]+persons[p][3])/2))
                    for p in group if p in persons]
@@ -209,7 +239,15 @@ class Watcher:
                 'knownFaces': self.facebook.roster() if self.facebook else [],
                 'faces': [{'name': f['name'], 'score': f['score'], 'liveness': f['liveness']}
                           for f in faces_out],
-                'genericOn': self.generic_on, 'genericObjects': len(generic_ids)}
+                'genericOn': self.generic_on, 'genericObjects': len(generic_ids),
+                'faceStateOn': self.face_state_on,
+                'faceStates': {
+                    'smiling': sum(s['smile'] for s in face_states),
+                    'frowning': sum(s['frown'] for s in face_states),
+                    'mouthOpen': sum(s['mouth_open'] for s in face_states),
+                    'eyesClosed': sum(s['eyes_closed'] for s in face_states),
+                    'lookingAway': sum(not s['facing'] for s in face_states),
+                }}
 
 def main():
     torch.set_num_threads(4)
@@ -228,6 +266,10 @@ def main():
                 continue
             if 'generic' in data:
                 watcher.generic_on = bool(data['generic'])
+                continue
+            if 'faceState' in data:
+                watcher.face_state_on = bool(data['faceState'])
+                watcher.fsw.set_enabled(watcher.face_state_on)
                 continue
             if 'attendance' in data:
                 watcher.attendance_on = bool(data['attendance'])

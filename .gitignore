@@ -2,6 +2,7 @@ camera-config.json
 roles-config.json
 attendance-config.json
 generic-config.json
+facestate-config.json
 face-db.json
 attendance-records.json
 node_modules/

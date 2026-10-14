@@ -8,6 +8,7 @@ const roleForm = $('#roleForm'), roleList = $('#roleList');
 const attendanceToggle = $('#attendanceToggle'), livenessToggle = $('#livenessToggle'), enrollForm = $('#enrollForm');
 const attendanceStartInput = $('#attendanceStartTime'), attendanceEndInput = $('#attendanceEndTime');
 const genericToggle = $('#genericToggle');
+const faceStateToggle = $('#faceStateToggle');
 let previousState = 'idle', alerts = [], selectedId = null, alertSignature = '';
 let cameraAction = false, detectionAction = false, sourceDirty = false;
 let roles = [];
@@ -144,6 +145,10 @@ genericToggle.addEventListener('change', async () => {
   try { await post('/api/generic', { enabled: genericToggle.checked }); }
   catch (error) { genericToggle.checked = !genericToggle.checked; }
 });
+faceStateToggle.addEventListener('change', async () => {
+  try { await post('/api/facestate', { enabled: faceStateToggle.checked }); }
+  catch (error) { faceStateToggle.checked = !faceStateToggle.checked; }
+});
 attendanceToggle.addEventListener('change', async () => {
   try { await post('/api/attendance', { enabled: attendanceToggle.checked }); }
   catch (error) { $('#attendanceStatus').textContent = error.message; attendanceToggle.checked = !attendanceToggle.checked; }
@@ -219,6 +224,15 @@ function renderAttendance(status) {
   if (document.activeElement !== genericToggle) {
     genericToggle.checked = analysis.genericOn ?? status.genericEnabled ?? false;
   }
+  if (document.activeElement !== faceStateToggle) {
+    faceStateToggle.checked = analysis.faceStateOn ?? status.faceStateEnabled ?? false;
+  }
+  const fs = analysis.faceStates;
+  $('#faceStateMetrics').textContent = (analysis.faceStateOn && fs && !stale)
+    ? 'Face states — ' + ['smiling', 'frowning', 'mouthOpen', 'eyesClosed', 'lookingAway']
+        .filter(k => fs[k]).map(k => k.replace(/([A-Z])/g, ' $1').toLowerCase() + ': ' + fs[k]).join(', ')
+        + (Object.values(fs).some(Boolean) ? '' : 'no faces in view')
+    : '';
   const known = analysis.knownFaces || [];
   $('#enrolledList').textContent = known.length ? 'Enrolled: ' + known.join(', ') : 'No faces enrolled yet.';
   const faceStates = {
