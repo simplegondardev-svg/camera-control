@@ -10,7 +10,8 @@
     "test:tracking": ".venv\\Scripts\\python -m unittest test_tracking -v",
     "test:review": "node test-review.js",
     "test:attendance": "node test-attendance.js",
-    "test:liveness": ".venv\\Scripts\\python -m unittest test_liveness -v"
+    "test:liveness": ".venv\\Scripts\\python -m unittest test_liveness -v",
+    "test:recognition-only": ".venv\\Scripts\\python -m unittest test_recognition_only -v && node test-recognition-only.js && node test-recognition-status-ui.js"
   },
   "engines": {
     "node": ">=20"

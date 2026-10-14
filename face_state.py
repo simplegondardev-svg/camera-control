@@ -112,6 +112,23 @@ class FaceStateWorker:
         with self.lock:
             return list(self.results)
 
+    def get_status(self):
+        with self.lock:
+            return {'results': list(self.results), 'error': self.error}
+
+    def _process_frame(self, frame):
+        try:
+            if self.reader is None:
+                self.reader = FaceStateReader(self.model_path)
+            result = self.reader.read(frame)
+            with self.lock:
+                self.results = result
+                self.error = None
+        except Exception as error:
+            with self.lock:
+                self.error = (str(error).strip() or error.__class__.__name__)[:150]
+                self.results = []
+
     def _run(self):
         min_interval = 0.6   # cap to ~1.6 inferences/sec so it never saturates the CPU
         last = 0.0
@@ -128,16 +145,21 @@ class FaceStateWorker:
                 time.sleep(0.05)
                 continue
             last = time.monotonic()
-            try:
-                if self.reader is None:
-                    self.reader = FaceStateReader(self.model_path)
-                result = self.reader.read(frame)
-                with self.lock:
-                    self.results = result
-            except Exception as error:
-                self.error = str(error)[:150]
-                with self.lock:
-                    self.results = []
+            self._process_frame(frame)
+
+
+def face_state_metrics(status):
+    results = status['results']
+    return {
+        'faceStateError': status['error'],
+        'faceStates': {
+            'smiling': sum(state['smile'] for state in results),
+            'frowning': sum(state['frown'] for state in results),
+            'mouthOpen': sum(state['mouth_open'] for state in results),
+            'eyesClosed': sum(state['eyes_closed'] for state in results),
+            'lookingAway': sum(not state['facing'] for state in results),
+        },
+    }
 
 
 def label_for(state):
