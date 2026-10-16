@@ -69,7 +69,10 @@ class FaceStateReader:
                 'box': (int(min(xs) * width), int(min(ys) * height),
                         int(max(xs) * width), int(max(ys) * height)),
                 'smile': (pick('mouthSmileLeft') + pick('mouthSmileRight')) / 2 >= SMILE_T,
-                'frown': (pick('browDownLeft') + pick('browDownRight')) / 2 >= FROWN_T,
+                'frown': max((pick('browDownLeft') + pick('browDownRight')) / 2,
+                             (pick('mouthFrownLeft') + pick('mouthFrownRight')) / 2) >= FROWN_T,
+                'brow_score': (pick('browDownLeft') + pick('browDownRight')) / 2,
+                'mouth_frown_score': (pick('mouthFrownLeft') + pick('mouthFrownRight')) / 2,
                 'eyes_closed': (pick('eyeBlinkLeft') + pick('eyeBlinkRight')) / 2 >= EYES_CLOSED_T,
                 'mouth_open': pick('jawOpen') >= MOUTH_OPEN_T,
                 'facing': facing,
@@ -94,6 +97,9 @@ class FaceStateWorker:
         self.enabled = False
         self.error = None
         self.thread = None
+        self.sequence = 0
+        self.frame_at = None
+        self.context = None
 
     def set_enabled(self, enabled):
         self.enabled = bool(enabled)
@@ -104,9 +110,9 @@ class FaceStateWorker:
             with self.lock:
                 self.results = []
 
-    def submit(self, frame):
+    def submit(self, frame, frame_at=None, context=None):
         with self.lock:
-            self.latest = frame
+            self.latest = (frame, frame_at, context)
 
     def get(self):
         with self.lock:
@@ -116,7 +122,12 @@ class FaceStateWorker:
         with self.lock:
             return {'results': list(self.results), 'error': self.error}
 
-    def _process_frame(self, frame):
+    def get_observation(self):
+        with self.lock:
+            return {'results': list(self.results), 'error': self.error,
+                    'sequence': self.sequence, 'frameAt': self.frame_at, 'context': self.context}
+
+    def _process_frame(self, frame, frame_at=None, context=None):
         try:
             if self.reader is None:
                 self.reader = FaceStateReader(self.model_path)
@@ -124,10 +135,14 @@ class FaceStateWorker:
             with self.lock:
                 self.results = result
                 self.error = None
+                self.sequence += 1
+                self.frame_at, self.context = frame_at, context
         except Exception as error:
             with self.lock:
                 self.error = (str(error).strip() or error.__class__.__name__)[:150]
                 self.results = []
+                self.sequence += 1
+                self.frame_at, self.context = frame_at, context
 
     def _run(self):
         min_interval = 0.6   # cap to ~1.6 inferences/sec so it never saturates the CPU
@@ -145,7 +160,7 @@ class FaceStateWorker:
                 time.sleep(0.05)
                 continue
             last = time.monotonic()
-            self._process_frame(frame)
+            self._process_frame(*frame)
 
 
 def face_state_metrics(status):

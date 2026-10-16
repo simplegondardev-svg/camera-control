@@ -1,7 +1,104 @@
-# Camera Control
+# Attendance Desk
 
-Local Android RTSP preview, person/object tracking, disappearance review alerts,
-and a saved evidence review dashboard.
+Local camera face attendance station with staff profiles, individual schedules,
+explicit check-in/check-out scans, and SQLite storage.
+
+## Attendance workflow
+
+Run `npm start` and open http://127.0.0.1:4173. Node.js 22.13+ is required
+for its built-in SQLite driver; this PC uses Node.js 24. No database server
+or additional Node package is needed.
+
+1. Open **Staff & schedules**, then **Add staff member**. Enter a name, unique
+   staff ID, department, working days, start/end times, and grace minutes.
+2. For a short test, use **Use a one-minute test shift**. It sets today's
+   working day and a one-minute shift with zero grace. Any one-minute shift
+   is valid, including 23:59–00:00; end times before start mean overnight work.
+3. Connect the RTSP camera under **Camera setup** and press **Start station**.
+4. Select the saved staff profile, confirm consent, and **Capture face**.
+   Capture up to five samples per person. Only one face may be visible.
+5. Press **Check in** or **Check out**, then look at the camera. The scan has
+   20 seconds to recognize one enrolled face, with three consistent frames
+   spanning at least one second. Sightings without an armed scan never record
+   attendance. Multiple faces, unknown identities and failed liveness cannot
+   confirm a scan. Camera interruptions cancel the pending scan.
+6. Review **Daily attendance** or **Attendance log**, and export a date as CSV.
+
+Each IN opens a session and each OUT closes it. Repeated INs and OUTs without
+an open session are rejected. A three-second cooldown prevents accidental
+immediate repeats; it allows one-minute work sessions without needing a person
+to leave the picture. Multiple work sessions per day are supported. The first
+IN and final OUT appear in the daily table; completed minutes sum closed
+sessions. Overnight OUTs stay attached to the original shift date.
+
+Lateness measures minutes beyond the individual's grace period; early
+departure compares OUT to that session's scheduled end. Scans outside a
+scheduled workday remain possible and are marked unscheduled. Schedules do
+not block short tests. The camera's older global operating window does not
+gate station scans. The system never invents checkouts or marks someone absent
+because the camera is offline.
+
+Staff, schedules, binary float32 face embeddings, scanner settings, sessions,
+and scan events live in `attendance.sqlite` (gitignored), shared locally by
+Node and Python using WAL mode. Initial startup imports existing face samples
+and attendance history once from the legacy JSON files in one transaction.
+Original files remain untouched; imported records are labeled Legacy. Review
+the default working schedules assigned to imported staff. Deactivation
+retains history and excludes the person from recognition.
+Legacy records do not establish a current checked-in state. When a new explicit
+session exists on the same date, the daily table uses the station session;
+original legacy entries remain in SQLite and the archived JSON file.
+
+`npm run test:station` checks the SQLite rules, migration, API, CSV and
+desktop/mobile UI using temporary fixtures. Run
+`.venv/Scripts/python -m unittest discover -p "test_*.py" -v` for Python
+regressions and the face-only worker/model checks. The station uses
+`attendance-worker.py`; object and expression models are not run in this mode.
+
+## Checkout review
+
+Open **Checkout review** in the sidebar (or `/checkout.html`). Connect the
+camera, drag over the customer's position, and save the zone and checkout
+name. Alternatively select **Use full frame for testing**, then save.
+Press **Start monitoring**. With the current single camera, this switches
+off attendance recognition; starting the attendance station switches back.
+The checkout worker never loads staff identity models or face embeddings.
+
+Choose brow lowering, downturned-mouth movement, or either under **Frown signal
+source**. Both separate model scores are displayed live for tuning; they are
+signal strengths, not probabilities or customer mood assessments. Existing
+recorded brow-only events retain their original labels. A visible selected
+signal above the default 0.30 threshold must persist across
+at least three samples and one second. Temporary geometric tracking suppresses
+repeated events while the signal continues; a neutral period and the default
+20-second cooldown allow a new event. Missing/ambiguous faces, detector errors
+and camera interruptions clear incomplete candidates. Tracking does not identify
+customers or link their visits. Camera interruptions can lose temporary tracks.
+The preview reuses the original smile/frown/neutral expression labels and
+background inference worker. Only fresh model samples contribute to events;
+repeated cached results never accumulate signal duration. Head-direction
+labels do not suppress an otherwise detected frown. Model warm-up is shown
+explicitly while the camera preview continues running.
+
+Events store the checkout name, first observed time, confirmation timestamp,
+signal duration at confirmation, and brow score in SQLite. Clips use the
+existing local recorder with up to five seconds of preceding footage and five
+seconds after capture starts. Shortened captures and failed encodes remain
+visible. Clip journals support interrupted recovery; saved metadata reconciles
+checkout records after a restart. Review a selected date, watch/download a clip,
+mark Reviewed / False detection / Unclear, add observed operational context
+and notes. These are facial-movement review cues, not customer mood ratings.
+There is no automatic clip deletion; retention remains operator-controlled.
+
+Run `npm run test:checkout` to validate tracking, SQLite events/reviews, media,
+real model loading, and desktop/mobile UI with temporary fixtures.
+
+## Earlier camera workspace (reference)
+
+The previous camera UI is retained at `/index.html` for future work. Its
+object-analysis worker can be selected with `CAMERA_FEATURE_MODE=vision`.
+The following sections document those earlier features; attendance setup
+and scanning should use the workflow above.
 
 ## Run
 
@@ -117,7 +214,7 @@ proof of liveness or identity.
 
 ## Setup on another Windows computer
 
-Install Node.js 20+, Python, and FFmpeg. Both `ffmpeg` and `ffprobe` must be
+Install Node.js 22.13+, Python, and FFmpeg. Both `ffmpeg` and `ffprobe` must be
 available on your system `PATH`. To use executables outside `PATH`, set
 `FFMPEG_PATH` and `FFPROBE_PATH` to their executable paths before starting the
 application or running the review test. Then run:
@@ -169,5 +266,70 @@ writes.
 `npm run test:review` uses isolated temporary fixtures to validate encoding,
 interrupted recovery, playback/seek, review persistence, API errors, and the UI.
 
+### Staff work areas
+
+Open `/workareas.html` or choose Work areas in the sidebar. Check staff in through
+the attendance station first. Draw floor regions on a fixed camera view, assign
+each staff member a distinct bright color marker and their allowed regions, then
+start tracking. The camera should show people from their upper body to their feet.
+The five-second allowance shortcut is useful for testing outside-area events.
+
+Multiple staff can be tracked together during their open attendance sessions.
+The midpoint of two ankle landmarks determines the region. Both ankles require at least 70% model confidence; missing, cropped or unreliable landmarks produce uncertainty and reset the outside timer. The UI shows this protection and draws green ankle dots. Pose confidence is an estimate, so review errors during real-camera testing. Reports and timelines store inside,
+outside, uncertain and unobserved durations in SQLite, with review notes for
+outside events. Missing markers, overlapping people, region boundaries and camera
+gaps do not count as confirmed outside time. Another person wearing the same
+color can be confused with a staff member; review exceptions before acting on them.
+One camera runs attendance, checkout or work-area detection at a time.
+`npm run test:workareas` checks the database, browser UI and real person-model worker.
+
+The Role gatherings panel reuses these polygons. Save distinct role colors,
+choose a region, and set minimum counts (Sales 1 + Cashier 1, or Sales 3) and
+a sustained duration. The five-second shortcut supports quick testing. Regions
+without enabled rules are excluded. Shared role colors count separate temporary
+person tracks and do not identify named employees or require attendance check-in.
+Use role markers with different colors from personal work-area markers.
+Live counts, timers, timestamped events, duration and review notes use SQLite.
+Missing ankles, unreadable markers, overlap, camera gaps and departure of a
+required person reset the timer; extra arrivals do not restart an existing group.
+These observations establish shared region occupancy, not conversation or intent.
+`npm run test:gatherings` checks the tracking rules, persistence and browser UI.
+
+For a tabletop rehearsal, select **Tracking input → Tabletop test** and apply
+the mode. Point the camera down at a plain table, draw regions on the image,
+and choose role colors matching bright saturated paper. Each separate paper
+piece is a temporary role token; its center determines its region. Keep pieces
+apart, avoid similarly colored backgrounds and move slowly. Touching pieces
+can merge, while fast or ambiguous movement resets identity and timers.
+Use the same gathering rules and the five-second shortcut. Paper events are
+stored with `input_mode=tabletop` and displayed with TEST labels. Mode changes
+reset timers. Individual staff location recording is paused in paper mode;
+switch back to People for ankle checks and actual staff tracking.
+`.venv/Scripts/python -m unittest test_tabletop_tracking -v` tests paper tracking
+and the complete worker protocol without person detections.
+
 The local server listens only on `127.0.0.1`. The generated `camera-config.json`
 is ignored by Git and may contain the camera password; keep it private.
+
+Tabletop mode also supports Black plastic (#000000) and White paper (#ffffff) role presets. Use a plain mid-gray or brown surface with even lighting. Very dark shadows or bright reflections can produce false pieces. Black/white roles are ignored in People mode; saturated color markers remain required there.
+
+
+For a minimal full-frame preview, open /blackwhite.html (Black & White in navigation). Connect the camera and start detection. This mode uses brightness masks and needs no staff, roles, regions or rules. Orange boxes show black regions; blue boxes show white regions. Large frame backgrounds are suppressed; shadows, highlights and touching objects can affect counts.
+
+
+The simple preview now detects Pink & White instead of Black & White to avoid dark shadows counting as black items. Existing /blackwhite.html and API addresses remain compatible. Pink uses a saturated pink/magenta hue mask; white still uses low saturation and high brightness.
+
+
+Pink & White now supports drawing shared SQLite work regions directly on its preview: Draw area, click at least three corners, name it and Save area. Each region lists live pink/white counts using normalized component centroids, with near-boundary centers excluded. Undo point and Cancel correct a draft; Remove deletes a saved area unless a staff assignment or gathering rule still uses it.
+
+Under Staying-together timers, choose an area, minimum pink/white counts and
+duration (five seconds by default), then save. Use Pink 1 + White 1 for mixed
+groups, or Pink 3 + White 0 for same-color groups. The server tracks a stable
+minimum cohort; required departures, missing/cropped/ambiguous pieces, camera
+gaps, edits and stops reset its timer. Extra arrivals do not reset a retained
+cohort. SQLite records one TEST event per continuous gathering, with start,
+confirmation, last observed/end time, duration and review notes. Events remain
+available after restart. Each area can have its own rules. Pieces are temporary
+visual tracks, so fast movement or touching pieces can disrupt identity.
+`node test-preview-gatherings.js` checks timers, persistence and the real API.
+

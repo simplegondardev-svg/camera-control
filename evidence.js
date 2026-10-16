@@ -90,9 +90,9 @@ class EvidenceStore {
   }
   begin(event, currentFrame) {
     const id = randomUUID();
-    const record = { id, at: new Date().toISOString(), headline: event.headline,
+    const record = { id, at: event.at || new Date().toISOString(), headline: event.headline,
       object: event.object || 'item', temporaryPersonId: event.temporaryPersonId || null,
-      reason: event.reason, source: event.source || 'automatic', review: 'unreviewed', notes: '', mediaStatus: 'capturing' };
+      reason: event.reason, source: event.source || 'automatic', review: 'unreviewed', notes: '', mediaStatus: 'capturing', checkoutEvent: event.checkoutEvent || null };
     this.records.set(id, record);
     try {
       fs.mkdirSync(this.folder(id));
@@ -100,7 +100,7 @@ class EvidenceStore {
       if (event.pickup) fs.writeFileSync(path.join(this.folder(id), 'snapshot_pickup.jpg'), Buffer.from(event.pickup, 'base64'));
       if (currentFrame) fs.writeFileSync(path.join(this.folder(id), 'snapshot_disappear.jpg'), currentFrame);
       for (const frame of this.buffer) this.append(id, frame);
-      this.pending.set(id, Date.now()+2500);
+      this.pending.set(id, Date.now()+(event.source==='checkout'?5000:2500));
     } catch { this.fail(id, 'Could not save evidence. Check available disk space.'); }
     return id;
   }

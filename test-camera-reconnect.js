@@ -94,6 +94,12 @@ function createHarness() {
     if (name === 'node:readline') return readlineStub;
     if (name === './evidence') return { EvidenceStore };
     if (name === './attendance') return attendance;
+    if (name === './station-store') return { StationStore: class extends AttendanceStore {
+      config() { return {}; }
+      cancel() {}
+    } };
+    if (name === './checkout-store') return { CheckoutStore: class { config() { return {}; } } };
+    if (name === './workarea-store') return { WorkAreaStore: class { pause() {} } };
     if (name === './recognition-runtime') return recognitionRuntime;
     if (name === './recognition-mode') return recognitionMode;
     throw new Error(`Unexpected module requested by server harness: ${name}`);

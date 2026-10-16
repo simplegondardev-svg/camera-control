@@ -67,7 +67,7 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
-  await page.goto(base);
+  await page.goto(base+'/index.html');
   await page.getByRole('button', { name: 'Open review' }).first().waitFor();
   await page.locator('.review-card').filter({ hasText: 'Test disappearance review' }).getByRole('button').click();
   await page.waitForFunction(() => document.querySelector('#reviewVideo').readyState >= 2);

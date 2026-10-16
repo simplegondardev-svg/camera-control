@@ -1,0 +1,42 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const {spawn}=require('node:child_process');
+const {chromium}=require('playwright-core');
+const {StationStore}=require('./station-store');
+const {CheckoutStore}=require('./checkout-store');
+const {EvidenceStore}=require('./evidence');
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-review-test-'));
+const dbFile=path.join(root,'attendance.sqlite'),clips=path.join(root,'clips');
+let station,store,browser,child;
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function main(){
+  station=new StationStore(dbFile);const checkout=new CheckoutStore(station);
+  const config={checkout:'Test checkout',zone:{x:0,y:0,width:1,height:1},sustainSeconds:1,threshold:.3,cooldownSeconds:20};
+  checkout.saveConfig(config);assert.throws(()=>checkout.saveConfig({...config,zone:{x:.5,y:0,width:1,height:1}}),/zone/);
+  assert.throws(()=>checkout.saveConfig({...config,threshold:0}),/threshold/);
+  store=new EvidenceStore(clips,process.env.FFMPEG_PATH||'ffmpeg');
+  const image=fs.readFileSync(path.join(__dirname,'.venv/Lib/site-packages/ultralytics/assets/bus.jpg')),now=Date.now();
+  for(let i=0;i<25;i++)store.addFrame(image,now-5000+i*200);
+  const event={startedAt:now-1000,confirmedAt:now,durationSeconds:1,browScore:.7,checkout:config.checkout};
+  const id=store.begin({source:'checkout',headline:'Brow lowering',reason:'Test fixture',at:new Date(now).toISOString(),checkoutEvent:event},image);
+  checkout.add(id,event,config);
+  for(let i=1;i<=25;i++)store.addFrame(image,now+i*200);
+  await store.close();assert.equal(store.list()[0].mediaStatus,'ready');
+  checkout.review(id,{review:'reviewed',category:'price_check',notes:'Observed a price check.'});
+  const local=new Date(now),date=`${local.getFullYear()}-${String(local.getMonth()+1).padStart(2,'0')}-${String(local.getDate()).padStart(2,'0')}`;
+  assert.equal(checkout.list(date)[0].notes,'Observed a price check.');station.close();station=null;
+  const base='http://127.0.0.1:4195';
+  child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:'4195',CAMERA_DB_PATH:dbFile,CAMERA_DATA_DIR:clips},windowsHide:true});child.stderr.on('data',data=>process.stderr.write(data));
+  for(let i=0;i<40;i++){try{if((await fetch(base+'/api/status')).ok)break;}catch{}await pause(100);}
+  const records=await (await fetch(base+'/api/checkout/events?date='+date)).json();assert.equal(records.events.length,1);assert.equal(records.events[0].notes,'Observed a price check.');
+  assert.equal((await fetch(base+'/api/checkout/start',{method:'POST'})).status,409);
+  assert.equal((await fetch(base+'/api/checkout/events?date=2026-02-30')).status,400);
+  browser=await chromium.launch({channel:'msedge',headless:true});const page=await browser.newPage({viewport:{width:1440,height:1050}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto(base+'/checkout.html');await page.getByRole('button',{name:'Open review',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Use full frame for testing'}).click();await page.getByRole('button',{name:'Save zone & settings'}).click();await page.getByText('Zone and rules saved. Ready to start monitoring.').waitFor();
+  await page.getByRole('button',{name:'Open review',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#eventVideo').readyState>=2);
+  await page.locator('#reviewStatus').selectOption('false_detection');await page.locator('#reviewCategory').selectOption('');await page.locator('#reviewNotes').fill('False detection in test fixture.');await page.getByRole('button',{name:'Save review',exact:true}).click();await page.getByText('Review saved.',{exact:true}).waitFor();await page.locator('#closeEvent').click();await page.reload();await page.getByRole('button',{name:'Open review',exact:true}).click();assert.equal(await page.locator('#reviewNotes').inputValue(),'False detection in test fixture.');await page.locator('#closeEvent').click();
+  await page.screenshot({path:path.join(__dirname,'.setup','checkout-desktop.png'),fullPage:true});await page.setViewportSize({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:path.join(__dirname,'.setup','checkout-mobile.png'),fullPage:true});assert.deepEqual(errors,[]);
+  console.log('PASS: checkout zone validation, SQLite event/review persistence, 5-second pre/post clip encoding, recovery, API guards, video playback and desktop/mobile UI.');
+}
+main().catch(error=>{console.error(error);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();if(child)child.kill();if(station)station.close();if(store)clearInterval(store.timer);});

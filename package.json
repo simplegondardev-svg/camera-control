@@ -1,22 +1,26 @@
 {
-  "name": "camera-control",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Local camera-only review system prototype",
-  "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js",
-    "check": "node --check server.js && node --check evidence.js && node --check public/app.js",
-    "test:tracking": ".venv\\Scripts\\python -m unittest test_tracking -v",
-    "test:review": "node test-review.js",
-    "test:attendance": "node test-attendance.js",
-    "test:liveness": ".venv\\Scripts\\python -m unittest test_liveness -v",
-    "test:recognition-only": ".venv\\Scripts\\python -m unittest test_recognition_only -v && node test-recognition-only.js && node test-recognition-status-ui.js"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "devDependencies": {
-    "playwright-core": "^1.63.0"
-  }
+    "name":  "camera-control",
+    "version":  "0.1.0",
+    "private":  true,
+    "description":  "Local face attendance station with SQLite staff and schedules",
+    "scripts":  {
+                    "dev":  "node server.js",
+                    "start":  "node server.js",
+                    "check":  "node --check server.js \u0026\u0026 node --check station-store.js \u0026\u0026 node --check checkout-store.js \u0026\u0026 node --check workarea-store.js \u0026\u0026 node --check public/station.js \u0026\u0026 node --check public/checkout.js \u0026\u0026 node --check public/workareas.js \u0026\u0026 node --check evidence.js \u0026\u0026 node --check public/app.js \u0026\u0026 node --check gathering-store.js \u0026\u0026 node --check public/gathering.js && node --check public/blackwhite.js && node --check public/preview-areas.js && node --check public/preview-timers.js && node --check preview-gatherings.js",
+                    "test:station":  "node test-station.js",
+                    "test:checkout":  "node test-checkout.js \u0026\u0026 .venv\\Scripts\\python -m unittest test_checkout -v",
+                    "test:workareas":  "node test-workareas.js \u0026\u0026 .venv\\Scripts\\python -m unittest test_workarea_tracking -v",
+                    "test:tracking":  ".venv\\Scripts\\python -m unittest test_tracking -v",
+                    "test:review":  "node test-review.js",
+                    "test:attendance":  "node test-attendance.js",
+                    "test:liveness":  ".venv\\Scripts\\python -m unittest test_liveness -v",
+                    "test:recognition-only":  ".venv\\Scripts\\python -m unittest test_recognition_only -v \u0026\u0026 node test-recognition-only.js \u0026\u0026 node test-recognition-status-ui.js",
+                    "test:gatherings":  "node test-gatherings.js \u0026\u0026 .venv\\Scripts\\python -m unittest test_gathering_tracking -v"
+                },
+    "engines":  {
+                    "node":  "\u003e=22.13"
+                },
+    "devDependencies":  {
+                            "playwright-core":  "^1.63.0"
+                        }
 }

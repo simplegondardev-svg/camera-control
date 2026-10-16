@@ -13,3 +13,4 @@ __pycache__/
 clips/
 .sites-runtime/
 Ultralytics/
+attendance.sqlite*

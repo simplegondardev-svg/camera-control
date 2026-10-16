@@ -5,15 +5,19 @@ const os = require('node:os');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { chromium } = require('playwright-core');
+const { StationStore } = require('./station-store');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'camera-extras-test-'));
 const base = 'http://127.0.0.1:4191';
+const dbFile = path.join(root,'attendance.sqlite');
+function readConfig() { const store=new StationStore(dbFile);const config=store.config();store.close();return config; }
 let child, browser;
 const pause = ms => new Promise(r => setTimeout(r, ms));
 async function main() {
-  for (const file of ['server.js', 'evidence.js', 'attendance.js']) fs.copyFileSync(path.join(__dirname,file),path.join(root,file));
+  for (const file of ['server.js', 'evidence.js', 'attendance.js','station-store.js','checkout-store.js','workarea-store.js','gathering-store.js','preview-gatherings.js','recognition-mode.js','recognition-runtime.js']) fs.copyFileSync(path.join(__dirname,file),path.join(root,file));
   fs.cpSync(path.join(__dirname,'public'),path.join(root,'public'),{recursive:true});
   fs.writeFileSync(path.join(root,'attendance-config.json'), JSON.stringify({ enabled: true }, null, 2));
-  child = spawn(process.execPath, [path.join(root,'server.js')], {cwd:root,env:{...process.env,PORT:'4191',CAMERA_DATA_DIR:path.join(root,'clips')},windowsHide:true});
+  const initialStore=new StationStore(dbFile,{legacyDir:root});initialStore.close();
+  child = spawn(process.execPath, [path.join(root,'server.js')], {cwd:root,env:{...process.env,PORT:'4191',CAMERA_DB_PATH:dbFile,CAMERA_DATA_DIR:path.join(root,'clips')},windowsHide:true});
   for (let i=0;i<50;i++) { try { if ((await fetch(base+'/api/status')).ok) break; } catch {} await pause(100); }
   const attendanceResponse = await fetch(base+'/api/attendance/records');
   assert.equal(attendanceResponse.status, 200);
@@ -30,7 +34,7 @@ async function main() {
     body:JSON.stringify({ attendanceStartTime:'07:15', attendanceEndTime:'21:30' }),
   });
   assert.equal(scheduleResponse.status, 200);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8')), {
+  assert.deepEqual(readConfig(), {
     enabled:true,
     livenessEnabled:false,
     attendanceStartTime:'07:15',
@@ -42,7 +46,7 @@ async function main() {
     body:JSON.stringify({ attendanceEndTime:'06:00' }),
   });
   assert.equal(invalidScheduleResponse.status, 400);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8')), {
+  assert.deepEqual(readConfig(), {
     enabled:true,
     livenessEnabled:false,
     attendanceStartTime:'07:15',
@@ -51,7 +55,7 @@ async function main() {
   const serverExited = new Promise(resolve => child.once('exit', resolve));
   child.kill();
   await serverExited;
-  child = spawn(process.execPath, [path.join(root,'server.js')], {cwd:root,env:{...process.env,PORT:'4191',CAMERA_DATA_DIR:path.join(root,'clips')},windowsHide:true});
+  child = spawn(process.execPath, [path.join(root,'server.js')], {cwd:root,env:{...process.env,PORT:'4191',CAMERA_DB_PATH:dbFile,CAMERA_DATA_DIR:path.join(root,'clips')},windowsHide:true});
   let restartedStatus;
   for (let i=0;i<50;i++) {
     try {
@@ -68,7 +72,7 @@ async function main() {
   browser = await chromium.launch({channel:'msedge',headless:true});
   const page = await browser.newPage();
   const errors=[]; page.on('pageerror',e=>errors.push(e.message));
-  await page.goto(base);
+  await page.goto(base+'/index.html');
   await page.getByText('No attendance records yet.', { exact: true }).waitFor();
   assert.equal(await page.locator('#livenessToggle').isChecked(), false);
   assert.equal(await page.locator('#attendanceStartTime').inputValue(), '07:15');
@@ -89,7 +93,7 @@ async function main() {
       await page.locator('#attendanceEndTime').press('Tab');
     })(),
   ]);
-  let config = JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8'));
+  let config = readConfig();
   assert.deepEqual(config, {
     enabled:true,
     livenessEnabled:false,
@@ -105,7 +109,7 @@ async function main() {
     page.waitForResponse(r=>r.url().endsWith('/api/attendance') && r.request().method()==='POST'),
     page.check('#livenessToggle'),
   ]);
-  config = JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8'));
+  config = readConfig();
   assert.deepEqual(config, {
     enabled: true, livenessEnabled: true,
     attendanceStartTime: '08:30', attendanceEndTime: '21:45',
@@ -117,7 +121,7 @@ async function main() {
     page.waitForResponse(r=>r.url().endsWith('/api/attendance') && r.request().method()==='POST'),
     page.uncheck('#livenessToggle'),
   ]);
-  config = JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8'));
+  config = readConfig();
   assert.deepEqual(config, {
     enabled: true, livenessEnabled: false,
     attendanceStartTime: '08:30', attendanceEndTime: '21:45',
@@ -134,7 +138,7 @@ async function main() {
     page.waitForResponse(r=>r.url().endsWith('/api/attendance') && r.request().method()==='POST'),
     page.uncheck('#attendanceToggle'),
   ]);
-  config = JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8'));
+  config = readConfig();
   assert.deepEqual(config, {
     enabled: false, livenessEnabled: false,
     attendanceStartTime: '08:30', attendanceEndTime: '21:45',
@@ -143,7 +147,7 @@ async function main() {
     page.waitForResponse(r=>r.url().endsWith('/api/attendance') && r.request().method()==='POST'),
     page.check('#attendanceToggle'),
   ]);
-  config = JSON.parse(fs.readFileSync(path.join(root,'attendance-config.json'),'utf8'));
+  config = readConfig();
   assert.deepEqual(config, {
     enabled: true, livenessEnabled: false,
     attendanceStartTime: '08:30', attendanceEndTime: '21:45',
@@ -154,7 +158,7 @@ async function main() {
   await pause(300);
   await page.fill('#enrollName','Synthetic fixture');
   await page.locator('#enrollButton').click();
-  await page.getByText('Start detection first, then enroll',{exact:true}).waitFor();
+  await page.getByText('Save and select an active staff member before enrolling',{exact:true}).waitFor();
   assert(!fs.existsSync(path.join(root,'face-db.json')), 'No face database should be created');
   assert.equal(errors.length,0,errors.join('\n'));
   console.log('PASS: attendance schedule defaults, validates, persists across restart, and is editable in the UI; liveness defaults OFF and persists; attendance toggle preserves schedule/liveness; roles persist and enrollment guard remains.');

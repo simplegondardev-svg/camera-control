@@ -4,6 +4,9 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const { EvidenceStore } = require('./evidence');
+const { StationStore } = require('./station-store');
+const { CheckoutStore } = require('./checkout-store');
+const { WorkAreaStore } = require('./workarea-store');
 const { sanitizeRecognitionRuntime } = require('./recognition-runtime');
 const {
   canEnrollFaces,
@@ -31,7 +34,18 @@ const FACESTATE_FILE = path.join(__dirname, "facestate-config.json");
 const DEFAULT_URL = "rtsp://192.168.1.2:8554";
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 const evidence = new EvidenceStore(process.env.CAMERA_DATA_DIR || path.join(__dirname, 'clips'), FFMPEG);
-const attendanceStore = new AttendanceStore(path.join(__dirname, 'attendance-records.json'));
+const DB_FILE = process.env.CAMERA_DB_PATH || path.join(process.env.CAMERA_DATA_DIR || __dirname, 'attendance.sqlite');
+const attendanceStore = new StationStore(DB_FILE, { legacyDir: process.env.CAMERA_DB_PATH || process.env.CAMERA_DATA_DIR ? null : __dirname });
+const checkoutStore = new CheckoutStore(attendanceStore);
+const workAreaStore = new WorkAreaStore(attendanceStore);
+let workRuntime = { state: 'stopped', message: 'Work-area tracking is stopped.' };
+let checkoutConfig = checkoutStore.config();
+for (const saved of evidence.list()) {
+  if (saved.source === 'checkout' && saved.checkoutEvent) {
+    try { checkoutStore.add(saved.id, saved.checkoutEvent, { checkout: saved.checkoutEvent.checkout, sustainSeconds: 0, threshold: 0 }); }
+    catch { console.error('A checkout clip could not be reconciled with its saved event.'); }
+  }
+}
 
 const clients = new Set();
 let ffmpeg = null;
@@ -44,6 +58,9 @@ let detectorBusy = false;
 let detectionTimer = null;
 let detection = { state: "off", message: "Detection is off" };
 let currentFrame = null;
+let currentFrameAt = 0;
+let detectionMode = 'attendance';
+let checkoutRuntime = { state: 'stopped', message: 'Checkout monitoring is stopped.' };
 let analyzedFrame = null;
 let reconnectTimer = null;
 let reconnectAttemptId = null;
@@ -66,10 +83,11 @@ let genericEnabled = readGeneric();
 let faceStateEnabled = readFaceState();
 let lastEnroll = null;
 let attendanceError = null;
+let pendingEnrollment = null;
 
 function readAttendanceConfig() {
   try {
-    const config = JSON.parse(fs.readFileSync(ATTENDANCE_FILE, "utf8"));
+    const config = attendanceStore.config();
     const schedule = normalizeAttendanceSchedule(
       config.attendanceStartTime,
       config.attendanceEndTime,
@@ -127,6 +145,11 @@ function sendRoles(worker) {
 }
 
 function stopDetection(preserveIntent = false) {
+  workAreaStore.pause();
+  workRuntime = { state: 'stopped', message: 'Work-area tracking is stopped.' };
+  checkoutRuntime = { state: 'stopped', message: 'Checkout monitoring is stopped.' };
+  pendingEnrollment = null;
+  attendanceStore.cancel('Scanner stopped. Start the station to scan a face.');
   if (!preserveIntent) wantsDetection = false;
   clearTimeout(detectionTimer);
   const previous = detector;
@@ -152,7 +175,17 @@ function startDetection() {
     ? { state: "initializing", message: "Enabled in settings; initializing face recognition." }
     : { state: "disabled", message: "Face recognition is disabled in settings." };
   detection = { state: "loading", message: "Loading detection models…" };
-  const worker = spawn(path.join(__dirname, ".venv/Scripts/python.exe"), ["-u", path.join(__dirname, "detection.py")], { cwd: __dirname, windowsHide: true });
+  const workerMode = detectionMode;
+  if(workerMode==='blackwhite')recognitionRuntime={state:'disabled',message:'Black and white preview active.'};
+  if (workerMode === 'checkout') {
+    recognitionRuntime = { state: 'disabled', message: 'Customer review active; staff recognition is paused.' };
+    checkoutRuntime = { state: 'loading', message: 'Loading the facial movement detector…' };
+  }
+  if (workerMode === 'workarea') {
+    recognitionRuntime = { state: 'disabled', message: 'Work-area tracking active; face recognition is paused.' };
+    workRuntime = { state: 'loading', message: 'Loading person and color-marker tracking…' };
+  }
+  const worker = spawn(path.join(__dirname, ".venv/Scripts/python.exe"), ["-u", path.join(__dirname, workerMode === 'blackwhite' ? 'blackwhite-worker.py' : workerMode === 'workarea' ? 'workarea-worker.py' : workerMode === 'checkout' ? 'checkout-worker.py' : process.env.CAMERA_FEATURE_MODE === 'vision' ? 'detection.py' : 'attendance-worker.py')], { cwd: __dirname, windowsHide: true, env: { ...process.env, CAMERA_DB_PATH: DB_FILE } });
   let frameErrors = 0;
   let stderrTail = "";
   detector = worker;
@@ -180,6 +213,8 @@ function startDetection() {
       sendLine(worker, { generic: genericEnabled });
       sendLine(worker, { faceState: faceStateEnabled });
       sendLine(worker, { recognitionOnly: recognitionOnlyMode });
+      if (workerMode === 'checkout') sendLine(worker, { checkoutConfig });
+      if (workerMode === 'workarea') sendLine(worker, { workAreaConfig: workAreaStore.workerConfig() });
       detection = { state: "running", message: "Waiting for a camera frame" };
     } else if (result.type === "recognition_status") {
       recognitionRuntime = sanitizeRecognitionRuntime(result.recognitionRuntime);
@@ -188,8 +223,9 @@ function startDetection() {
       detectorBusy = false;
       frameErrors = 0;
       const { frame, type, events = [], enrolled, ...metrics } = result;
+      if (metrics.recognitionRuntime) recognitionRuntime = sanitizeRecognitionRuntime(metrics.recognitionRuntime);
       try {
-        recordAttendanceIfAllowed(attendanceEnabled, recognitionOnlyMode, () => {
+        recordAttendanceIfAllowed(attendanceEnabled && workerMode === 'attendance', recognitionOnlyMode, () => {
           attendanceStore.observe(metrics.faces, {
             livenessEnabled,
             attendanceStartTime: attendanceConfig.attendanceStartTime,
@@ -206,10 +242,33 @@ function startDetection() {
         }
       }
       for (const event of events) evidence.begin(event, analyzedFrame || currentFrame);
-      if (enrolled) lastEnroll = { ...enrolled, at: new Date().toISOString() };
+      if(workerMode==='blackwhite'){
+        try{workAreaStore.preview.observe(metrics.blackWhiteObjects,metrics.previewFrameAt,metrics.previewRevision);}
+        catch{workAreaStore.preview.pause();metrics.previewError='Could not save test events. Check the database and available disk space.';}
+      }
+      if (workerMode === 'checkout' && metrics.checkoutRevision === checkoutConfig.revision) {
+        if (metrics.checkoutRuntime) checkoutRuntime = metrics.checkoutRuntime;
+        for (const event of metrics.checkoutEvents || []) {
+          try {
+            const savedEvent = { ...event, checkout: checkoutConfig.checkout };
+            const id = evidence.begin({ source: 'checkout', at: new Date(event.confirmedAt).toISOString(), headline: 'Visible frown signal — review moment', object: event.signal === 'mouth' ? 'downturned mouth' : 'brow lowering', reason: 'Sustained visible facial movement in the configured customer zone. Review the context.', checkoutEvent: savedEvent }, analyzedFrame || currentFrame);
+            checkoutStore.add(id, event, checkoutConfig);
+          } catch { checkoutRuntime = { state: 'error', message: 'Could not save a checkout event. Check available disk space.' }; }
+        }
+      }
+      if (workerMode === 'workarea') {
+        try {
+          if(workAreaStore.gathering.mode()==='people'&&(metrics.workInputMode||'people')==='people')workAreaStore.observe(metrics.workObservations, metrics.workFrameAt, metrics.workRevision);
+          workAreaStore.gathering.observe(metrics.roleObservations, metrics.workFrameAt, metrics.workRevision,metrics.workInputMode||'people');
+          if (metrics.workRuntime) workRuntime = metrics.workRuntime;
+        } catch { workAreaStore.pause(); workRuntime = { state: 'error', message: 'Could not save work-area observations. Check the database and available disk space.' }; }
+      }
+      if (enrolled) { lastEnroll = { ...enrolled, at: new Date().toISOString() }; pendingEnrollment = null; }
       detection = { state: "running", message: "Detection active", updatedAt: new Date().toISOString(), ...metrics, enrollStatus: lastEnroll };
       sendFrame(Buffer.from(frame, "base64"));
     } else if (result.type === 'frame_error' || result.type === 'log') {
+      if(workerMode==='blackwhite')workAreaStore.preview.pause();
+      if (workerMode === 'workarea') workAreaStore.pause();
       clearTimeout(detectionTimer);
       detectorBusy = false;
       detection.message = 'Could not analyze a frame; retrying.';
@@ -322,6 +381,7 @@ function stopStream(message = "Stream disconnected") {
 
 function broadcastFrame(frame) {
   currentFrame = frame;
+  currentFrameAt = Date.now();
   evidence.addFrame(frame);
   clearTimeout(streamWatchdog);
   const watchdogAttemptId = ffmpegAttemptId;
@@ -351,7 +411,8 @@ function broadcastFrame(frame) {
         stopDetection();
         detection = { state: "error", message: "Analysis timed out. Try starting detection again." };
       }, 30000);
-      detector.stdin.write(JSON.stringify({ frame: frame.toString("base64") }) + "\n");
+      if (detectionMode === 'workarea') sendLine(detector, { workAreaConfig: workAreaStore.workerConfig() });
+      detector.stdin.write(JSON.stringify({ frame: frame.toString("base64"), frameAt: currentFrameAt, ...(detectionMode==='blackwhite'?{previewRevision:workAreaStore.revision()}:{}) }) + "\n");
     }
     return;
   }
@@ -553,7 +614,7 @@ function serveMedia(request, response, id, name) {
 }
 
 function serveStatic(request, response) {
-  const requestPath = request.url === "/" ? "/index.html" : request.url.split("?")[0];
+  const requestPath = request.url.split('?')[0] === "/" ? "/station.html" : request.url.split("?")[0];
   const filePath = path.normalize(path.join(PUBLIC_DIR, requestPath));
   if (!filePath.startsWith(PUBLIC_DIR + path.sep)) return writeJson(response, 403, { error: "Forbidden" });
   const types = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml" };
@@ -602,14 +663,174 @@ const server = http.createServer(async (request, response) => {
       attendanceStartTime: attendanceConfig.attendanceStartTime,
       attendanceEndTime: attendanceConfig.attendanceEndTime,
       attendanceWindowActive,
-      attendanceRecordingAllowed: attendanceEnabled && attendanceWindowActive,
+      attendanceRecordingAllowed: attendanceEnabled && detectionMode === 'attendance' && !recognitionOnlyMode && detectorReady && status.state === 'connected',
       genericEnabled,
       faceStateEnabled,
+      scan: attendanceStore.scanStatus(),
+      pendingEnrollment,
+      detectionMode,
+      checkoutRuntime,
+      workRuntime,
     });
   }
 
   if (pathname === "/api/attendance/records" && request.method === "GET") {
     return writeJson(response, 200, { records: attendanceStore.list(), error: attendanceError });
+  }
+
+  if (pathname === '/api/staff' && request.method === 'GET') {
+    return writeJson(response, 200, { staff: attendanceStore.staff() });
+  }
+  if (pathname === '/api/workareas/config' && request.method === 'GET') return writeJson(response, 200, workAreaStore.config());
+  if(pathname==='/api/blackwhite/start'&&request.method==='POST'){
+    if(status.state!=='connected')return writeJson(response,409,{error:'Connect a live camera first.'});
+    if(recognitionOnlyMode)return writeJson(response,409,{error:'Switch off recognition-only mode first.'});
+    detectionMode='blackwhite';startDetection();return writeJson(response,202,{state:'loading'});
+  }
+  if(pathname==='/api/blackwhite/stop'&&request.method==='POST'){if(detectionMode==='blackwhite')stopDetection();return writeJson(response,200,{state:'stopped'});}
+  if(pathname==='/api/blackwhite/gatherings'&&request.method==='GET'){
+    try{return writeJson(response,200,workAreaStore.preview.report(new URL(request.url,'http://localhost').searchParams.get('date')||undefined));}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const previewRule=/^\/api\/blackwhite\/rules\/([\w-]+)$/.exec(pathname);
+  if((pathname==='/api/blackwhite/rules'||previewRule)&&['POST','DELETE'].includes(request.method)){
+    try{if(recognitionOnlyMode)return writeJson(response,409,{error:'Timer configuration is disabled in recognition-only mode.'});if(request.method==='DELETE'){if(!previewRule)throw Error('Choose a saved rule');workAreaStore.preview.remove(previewRule[1]);return writeJson(response,200,{ok:true});}return writeJson(response,200,{rule:workAreaStore.preview.save(await readBody(request),previewRule?.[1])});}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const previewReview=/^\/api\/blackwhite\/events\/([\w-]+)\/review$/.exec(pathname);
+  if(previewReview&&request.method==='POST'){
+    try{return writeJson(response,200,workAreaStore.preview.review(previewReview[1],await readBody(request)));}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  if(pathname==='/api/workareas/gathering/mode'&&request.method==='POST'){
+    try{if(recognitionOnlyMode)return writeJson(response,409,{error:'Mode changes are disabled in recognition-only mode.'});return writeJson(response,200,workAreaStore.gathering.setMode((await readBody(request)).inputMode));}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const gatheringEdit = /^\/api\/workareas\/gathering\/(roles|rules)\/([\w-]+)$/.exec(pathname);
+  if ((pathname === '/api/workareas/gathering/roles' || pathname === '/api/workareas/gathering/rules' || gatheringEdit) && ['POST','DELETE'].includes(request.method)) {
+    try {
+      if (recognitionOnlyMode) return writeJson(response,409,{error:'Gathering configuration is disabled in recognition-only mode.'});
+      const kind=gatheringEdit?.[1]||pathname.split('/').pop(),id=gatheringEdit?.[2],store=workAreaStore.gathering;
+      if(request.method==='DELETE'){if(!id)throw Error('Select a saved role or rule');kind==='roles'?store.removeRole(id):store.removeRule(id);return writeJson(response,200,{ok:true});}
+      const input=await readBody(request);return writeJson(response,200,kind==='roles'?{role:store.saveRole(input,id)}:{rule:store.saveRule(input,id)});
+    }catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  if(pathname==='/api/workareas/gathering/report'&&request.method==='GET'){
+    try{return writeJson(response,200,workAreaStore.gathering.report(new URL(request.url,'http://localhost').searchParams.get('date')||undefined));}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const gatheringReview=/^\/api\/workareas\/gathering\/events\/([\w-]+)\/review$/.exec(pathname);
+  if(gatheringReview&&request.method==='POST'){
+    try{return writeJson(response,200,workAreaStore.gathering.review(gatheringReview[1],await readBody(request)));}catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const workZoneEdit = /^\/api\/workareas\/zones\/([\w-]+)$/.exec(pathname);
+  if ((pathname === '/api/workareas/zones' || workZoneEdit) && request.method === 'POST') {
+    try {
+      if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Work-area editing is disabled in recognition-only mode.' });
+      return writeJson(response, 200, { zone: workAreaStore.saveZone(await readBody(request), workZoneEdit?.[1]) });
+    } catch(error) { return writeJson(response, 400, {error:error.message}); }
+  }
+  if (workZoneEdit && request.method === 'DELETE') {
+    try {
+      if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Work-area editing is disabled in recognition-only mode.' });
+      workAreaStore.removeZone(workZoneEdit[1]); return writeJson(response, 200, {ok:true});
+    } catch(error) { return writeJson(response, 400, {error:error.message}); }
+  }
+  const workAssignment = /^\/api\/workareas\/staff\/([\w-]+)$/.exec(pathname);
+  if (workAssignment && request.method === 'POST') {
+    try {
+      if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Work-area editing is disabled in recognition-only mode.' });
+      return writeJson(response, 200, {assignment:workAreaStore.assign(workAssignment[1],await readBody(request))});
+    } catch(error) { return writeJson(response, 400, {error:error.message}); }
+  }
+  if (pathname === '/api/workareas/start' && request.method === 'POST') {
+    if (recognitionOnlyMode) return writeJson(response,409,{error:'Work tracking is disabled in recognition-only mode.'});
+    if (status.state !== 'connected') return writeJson(response,409,{error:'Connect the camera first.'});
+    if (!workAreaStore.zones().length || (!workAreaStore.assignments().length && !workAreaStore.gathering.rules().some(r=>r.enabled))) return writeJson(response,409,{error:'Save work regions and assign a staff marker or enable a gathering rule first.'});
+    detectionMode='workarea';startDetection();return writeJson(response,202,{state:'loading'});
+  }
+  if (pathname === '/api/workareas/stop' && request.method === 'POST') {if(detectionMode==='workarea')stopDetection();return writeJson(response,200,{state:'stopped'});}
+  if (pathname === '/api/workareas/report' && request.method === 'GET') {
+    try {return writeJson(response,200,workAreaStore.report(new URL(request.url,'http://localhost').searchParams.get('date')||undefined));}
+    catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const workTimeline = /^\/api\/workareas\/timeline\/([\w-]+)$/.exec(pathname);
+  if (workTimeline && request.method === 'GET') {
+    try {
+      const date=new URL(request.url,'http://localhost').searchParams.get('date');
+      return writeJson(response,200,{intervals:workAreaStore.timeline(workTimeline[1],date)});
+    }catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  const workReview = /^\/api\/workareas\/events\/([\w-]+)\/review$/.exec(pathname);
+  if (workReview && request.method === 'POST') {
+    try {return writeJson(response,200,workAreaStore.review(workReview[1],await readBody(request)));}
+    catch(error){return writeJson(response,400,{error:error.message});}
+  }
+  if (pathname === '/api/checkout/config' && request.method === 'GET') return writeJson(response, 200, checkoutConfig);
+  if (pathname === '/api/checkout/config' && request.method === 'POST') {
+    try {
+      if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Checkout configuration is disabled in recognition-only mode.' });
+      checkoutConfig = checkoutStore.saveConfig(await readBody(request));
+      if (detectorReady && detectionMode === 'checkout') sendLine(detector, { checkoutConfig });
+      return writeJson(response, 200, checkoutConfig);
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  if (pathname === '/api/checkout/start' && request.method === 'POST') {
+    if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Checkout monitoring is disabled in recognition-only mode.' });
+    if (status.state !== 'connected') return writeJson(response, 409, { error: 'Connect a live camera first.' });
+    if (!checkoutConfig.zone) return writeJson(response, 409, { error: 'Draw and save the customer zone first.' });
+    detectionMode = 'checkout'; startDetection();
+    return writeJson(response, 202, { state: 'loading' });
+  }
+  if (pathname === '/api/checkout/stop' && request.method === 'POST') {
+    if (detectionMode === 'checkout') stopDetection();
+    return writeJson(response, 200, { state: 'stopped' });
+  }
+  if (pathname === '/api/checkout/events' && request.method === 'GET') {
+    try {
+      const records = checkoutStore.list(new URL(request.url, 'http://localhost').searchParams.get('date') || undefined);
+      const media = new Map(evidence.list().map(record => [record.id, record]));
+      return writeJson(response, 200, { events: records.map(record => ({ ...record, media: media.get(record.id)?.media || {}, mediaStatus: media.get(record.id)?.mediaStatus || 'unavailable', partial: media.get(record.id)?.partial || false })), warning: evidence.error });
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  const checkoutReview = /^\/api\/checkout\/events\/([\w-]+)\/review$/.exec(pathname);
+  if (checkoutReview && request.method === 'POST') {
+    try { return writeJson(response, 200, checkoutStore.review(checkoutReview[1], await readBody(request))); }
+    catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  const staffEdit = /^\/api\/staff\/([\w-]+)$/.exec(pathname);
+  if ((pathname === '/api/staff' || staffEdit) && request.method === 'POST') {
+    try {
+      if (recognitionOnlyMode) return writeJson(response, 409, { error: 'Staff editing is disabled in recognition-only mode.' });
+      const staff = attendanceStore.saveStaff(await readBody(request), staffEdit?.[1]);
+      return writeJson(response, staffEdit ? 200 : 201, { staff });
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  if (pathname === '/api/attendance/day' && request.method === 'GET') {
+    try {
+      const date = new URL(request.url, 'http://localhost').searchParams.get('date') || undefined;
+      return writeJson(response, 200, { rows: attendanceStore.daily(date), events: attendanceStore.events(date), eventCount: attendanceStore.eventCount(date) });
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  if (pathname === '/api/attendance/export' && request.method === 'GET') {
+    try {
+      const date = new URL(request.url, 'http://localhost').searchParams.get('date') || undefined;
+      const cell = value => '"' + String(value ?? '').replace(/^[=+@-]/, "'$&").replace(/"/g, '""') + '"';
+      const rows = attendanceStore.daily(date);
+      const csv = [['Staff ID','Name','Department','Schedule','Status','Check in (UTC)','Check out (UTC)','Late minutes beyond grace','Early departure minutes','Completed work minutes'],
+        ...rows.map(row => [row.code,row.name,row.department,row.schedule,row.status,row.arrival,row.departure,row.lateMinutes,row.earlyMinutes,row.workedMinutes])].map(row => row.map(cell).join(',')).join('\r\n');
+      response.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="attendance.csv"', 'Cache-Control': 'no-store' });
+      return response.end('\ufeff' + csv);
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  if (pathname === '/api/attendance/scan' && request.method === 'POST') {
+    try {
+      if (recognitionOnlyMode || !attendanceEnabled) return writeJson(response, 409, { error: 'Start the attendance station first.' });
+      if (detectionMode !== 'attendance') return writeJson(response, 409, { error: 'Switch to the attendance station before scanning staff.' });
+      if (pendingEnrollment) return writeJson(response, 409, { error: 'Finish face enrollment before scanning attendance.' });
+      if (status.state !== 'connected' || !detectorReady || !status.lastFrameAt || Date.now() - Date.parse(status.lastFrameAt) > 3000) return writeJson(response, 409, { error: 'Connect a live camera and start the face scanner first.' });
+      if (recognitionRuntime.state !== 'ready') return writeJson(response, 409, { error: 'Face scanner is not ready yet. Wait for recognition to initialize.' });
+      return writeJson(response, 202, { scan: attendanceStore.arm((await readBody(request)).action) });
+    } catch (error) { return writeJson(response, 400, { error: error.message }); }
+  }
+  if (pathname === '/api/attendance/scan/cancel' && request.method === 'POST') {
+    attendanceStore.cancel();
+    return writeJson(response, 200, { scan: attendanceStore.scanStatus() });
   }
 
   if (pathname === "/api/roles" && request.method === "GET") {
@@ -691,7 +912,8 @@ const server = http.createServer(async (request, response) => {
         livenessEnabled: nextLivenessEnabled,
         ...schedule,
       };
-      fs.writeFileSync(ATTENDANCE_FILE, JSON.stringify(nextConfig, null, 2));
+      attendanceStore.setSetting('attendance_config', nextConfig);
+      attendanceStore.cancel('Scanner settings changed. Choose Check in or Check out when ready.');
       attendanceEnabled = nextEnabled;
       livenessEnabled = nextLivenessEnabled;
       attendanceConfig = nextConfig;
@@ -720,11 +942,15 @@ const server = http.createServer(async (request, response) => {
     }
     try {
       const body = await readBody(request);
-      const name = String(body.name || "").trim().slice(0, 40);
-      if (!name) return writeJson(response, 400, { error: "Enter a name for the face" });
+      const staff = attendanceStore.getStaff(body.staffId);
+      if (!staff || !staff.active) return writeJson(response, 400, { error: "Save and select an active staff member before enrolling" });
       if (!detector || !detectorReady) return writeJson(response, 409, { error: "Start detection first, then enroll" });
-      sendLine(detector, { enroll: name });
-      return writeJson(response, 202, { ok: true, name });
+      if (detectionMode !== 'attendance') return writeJson(response, 409, { error: 'Start the attendance station before enrolling a face.' });
+      attendanceStore.cancel('Enrollment in progress. Resume attendance scans after enrollment.');
+      lastEnroll = null;
+      pendingEnrollment = staff.id;
+      sendLine(detector, { enroll: staff.id });
+      return writeJson(response, 202, { ok: true, staffId: staff.id, name: staff.name });
     } catch (error) {
       return writeJson(response, 400, { error: error.message });
     }
@@ -733,7 +959,7 @@ const server = http.createServer(async (request, response) => {
   if (pathname === "/api/detection/start" && request.method === "POST") {
     if (status.state !== "connected") return writeJson(response, 409, { error: "Connect the camera first" });
     try {
-      if (!detector) startDetection();
+      if (!detector || detectionMode !== 'attendance') { detectionMode = 'attendance'; startDetection(); }
       return writeJson(response, 202, detection);
     } catch {
       stopDetection();
@@ -828,6 +1054,7 @@ async function shutdown(signal) {
   stopStream();
   for (const client of clients) client.end();
   await evidence.close();
+  attendanceStore.close();
   server.close(() => {
     logCameraDiagnostic("shutdown.completed", { signal });
     process.exit(0);
